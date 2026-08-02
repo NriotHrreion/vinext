@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import type { ReactFormState } from "react-dom/client";
 import type { NavigationContext } from "vinext/shims/navigation";
+import { isPprFallbackShellAbortError } from "vinext/shims/ppr-fallback-shell";
 import type { AppPageCacheSetter } from "./isr-cache.js";
 import type { RootParams } from "vinext/shims/root-params";
 import { runWithFetchDedupe } from "vinext/shims/fetch-cache";
@@ -745,6 +746,20 @@ export async function renderAppPageLifecycle(
   const compileEnd = options.isProduction ? undefined : performance.now();
   const baseOnError = options.createRscOnErrorHandler(options.cleanPathname, options.routePattern);
   const rscErrorTracker = createAppPageRscErrorTracker(baseOnError);
+  const getCapturedPrerenderFailure = () => {
+    const capturedRscError = rscErrorTracker.getCapturedError();
+    // PPR deliberately aborts its final render once the fallback shell is
+    // complete. React reports that cancellation through onError, but it is not
+    // a render failure and must not prevent the shell artifact from being kept.
+    if (
+      capturedRscError !== null &&
+      options.pprFallbackShellSignal !== undefined &&
+      isPprFallbackShellAbortError(capturedRscError)
+    ) {
+      return null;
+    }
+    return capturedRscError;
+  };
   // Defensive wrap for standalone callers. In the normal dispatch path this is
   // a no-op since dispatchAppPage already activated dedupe. Note that
   // renderToReadableStream returns synchronously — the actual fetch calls
@@ -1089,7 +1104,7 @@ export async function renderAppPageLifecycle(
   });
   if (htmlRender.response) {
     if (options.isPrerender === true) {
-      const capturedRscError = rscErrorTracker.getCapturedError();
+      const capturedRscError = getCapturedPrerenderFailure();
       if (capturedRscError !== null) {
         // A local error boundary can turn this failure into a successful 200
         // response. Static generation must reject it before the build persists
@@ -1160,7 +1175,7 @@ export async function renderAppPageLifecycle(
     );
   }
   if (options.isPrerender === true) {
-    const capturedRscError = rscErrorTracker.getCapturedError();
+    const capturedRscError = getCapturedPrerenderFailure();
     if (capturedRscError !== null) {
       // Full prerendering has settled the RSC render above, so publishing the
       // error boundary's successful HTML response would persist a poisoned

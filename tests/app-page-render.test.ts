@@ -873,6 +873,56 @@ describe("app page render lifecycle", () => {
     expect(common.isrSet).not.toHaveBeenCalled();
   });
 
+  // Next.js excludes expected render aborts from its captured static-generation
+  // error map: https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/create-error-handler.tsx
+  it("preserves PPR fallback shells after an expected prerender abort", async () => {
+    const common = createCommonOptions();
+    const pprAbortController = new AbortController();
+    const pprAbort = new DOMException("The operation was aborted", "AbortError");
+    const abortPprFallbackShell = vi.fn(() => pprAbortController.abort());
+    const prerenderToReadableStream = vi.fn(
+      async (
+        _element,
+        options: {
+          onError: (error: unknown, requestInfo: unknown, errorContext: unknown) => unknown;
+          signal?: AbortSignal;
+        },
+      ) => {
+        expect(options.signal).toBe(pprAbortController.signal);
+        return {
+          prelude: new ReadableStream<Uint8Array>({
+            start(controller) {
+              options.signal?.addEventListener(
+                "abort",
+                () => {
+                  options.onError(pprAbort, null, null);
+                  controller.enqueue(new TextEncoder().encode("flight-data"));
+                  controller.close();
+                },
+                { once: true },
+              );
+            },
+          }),
+        };
+      },
+    );
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      abortPprFallbackShell,
+      isPrerender: true,
+      isProduction: true,
+      pprFallbackShellSignal: pprAbortController.signal,
+      prerenderToReadableStream,
+    });
+
+    expect(abortPprFallbackShell).toHaveBeenCalledOnce();
+    expect(prerenderToReadableStream).toHaveBeenCalledOnce();
+    expect(common.renderErrorBoundaryResponse).not.toHaveBeenCalled();
+    await expect(response.text()).resolves.toBe("<html>page</html>");
+    expect(common.isrSet).not.toHaveBeenCalled();
+  });
+
   it("rejects captured RSC errors before returning a prerender error-boundary response", async () => {
     const common = createCommonOptions();
     const rscError = new Error("rsc-original");
