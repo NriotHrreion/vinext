@@ -807,6 +807,8 @@ describe("app page render lifecycle", () => {
   // Next.js static generation and revalidation rethrow captured RSC errors
   // before publishing an APP_PAGE cache entry:
   // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/app-render.tsx
+  // Upstream build coverage:
+  // https://github.com/vercel/next.js/blob/canary/test/production/app-dir/client-page-error-bailout/client-page-error-bailout.test.ts
   // See also: https://github.com/cloudflare/vinext/issues/2783
   it("rejects ordinary RSC errors captured during full prerender", async () => {
     const common = createCommonOptions();
@@ -868,6 +870,44 @@ describe("app page render lifecycle", () => {
     await expect(responsePromise).rejects.toBe(renderError);
     expect(cancelHtmlStream).toHaveBeenCalledOnce();
     expect(clearRequestContext).toHaveBeenCalledOnce();
+    expect(common.isrSet).not.toHaveBeenCalled();
+  });
+
+  it("rejects captured RSC errors before returning a prerender error-boundary response", async () => {
+    const common = createCommonOptions();
+    const rscError = new Error("rsc-original");
+    const ssrError = new Error("ssr-decoder");
+    const cancelBoundaryResponse = vi.fn();
+    const renderErrorBoundaryResponse = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            cancel: cancelBoundaryResponse,
+          }),
+        ),
+    );
+
+    const responsePromise = renderAppPageLifecycle({
+      ...common.options,
+      isPrerender: true,
+      isProduction: true,
+      async loadSsrHandler() {
+        return {
+          async handleSsr() {
+            throw ssrError;
+          },
+        };
+      },
+      renderErrorBoundaryResponse,
+      renderToReadableStream(_element, { onError }) {
+        onError(rscError, null, null);
+        return createStream(["flight-data"]);
+      },
+    });
+
+    await expect(responsePromise).rejects.toBe(rscError);
+    expect(renderErrorBoundaryResponse).toHaveBeenCalledWith(rscError, "rsc");
+    expect(cancelBoundaryResponse).toHaveBeenCalledOnce();
     expect(common.isrSet).not.toHaveBeenCalled();
   });
 

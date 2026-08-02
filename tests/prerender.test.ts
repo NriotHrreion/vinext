@@ -876,6 +876,17 @@ describe("prerenderApp — default mode (app-basic)", () => {
     expect(fs.existsSync(path.join(outDir, "react19-dev-rsc-error.rsc"))).toBe(false);
   });
 
+  it("does not persist a local error-boundary response from speculative prerender", () => {
+    const r = findRoute(results, "/error-server-test");
+    expect(r).toMatchObject({
+      route: "/error-server-test",
+      status: "skipped",
+      reason: "dynamic",
+    });
+    expect(fs.existsSync(path.join(outDir, "error-server-test.html"))).toBe(false);
+    expect(fs.existsSync(path.join(outDir, "error-server-test.rsc"))).toBe(false);
+  });
+
   it("records App Router preload Link headers for cache seeding", () => {
     const r = findRoute(results, "/nextjs-compat/react-max-headers-length");
     expect(r).toMatchObject({

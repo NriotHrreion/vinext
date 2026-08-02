@@ -1088,6 +1088,16 @@ export async function renderAppPageLifecycle(
     resolveSpecialError: resolveAppPageSpecialError,
   });
   if (htmlRender.response) {
+    if (options.isPrerender === true) {
+      const capturedRscError = rscErrorTracker.getCapturedError();
+      if (capturedRscError !== null) {
+        // A local error boundary can turn this failure into a successful 200
+        // response. Static generation must reject it before the build persists
+        // that fallback response as the route's deployment artifact.
+        await htmlRender.response.body?.cancel().catch(() => {});
+        throw capturedRscError;
+      }
+    }
     return htmlRender.response;
   }
   let htmlStream = htmlRender.htmlStream;
