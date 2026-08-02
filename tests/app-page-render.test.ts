@@ -808,6 +808,69 @@ describe("app page render lifecycle", () => {
   // before publishing an APP_PAGE cache entry:
   // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/app-render.tsx
   // See also: https://github.com/cloudflare/vinext/issues/2783
+  it("rejects ordinary RSC errors captured during full prerender", async () => {
+    const common = createCommonOptions();
+    const renderError = new Error("upstream failed during prerender");
+    const clearRequestContext = vi.fn();
+    const cancelHtmlStream = vi.fn();
+    let capturedOnError:
+      | ((error: unknown, requestInfo: unknown, errorContext: unknown) => unknown)
+      | undefined;
+
+    const responsePromise = renderAppPageLifecycle({
+      ...common.options,
+      clearRequestContext,
+      hasLoadingBoundary: true,
+      isPrerender: true,
+      isProduction: true,
+      loadSsrHandler: async () => ({
+        async handleSsr(
+          _rscStream,
+          _navigationContext,
+          _fontData,
+          options?: {
+            capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
+            sideStream?: ReadableStream<Uint8Array>;
+          },
+        ) {
+          if (options?.sideStream) {
+            void options.sideStream.getReader().cancel();
+          }
+
+          const capturedRscData = Promise.resolve().then(() => {
+            capturedOnError?.(renderError, null, null);
+            return new TextEncoder().encode("flight-error").buffer;
+          });
+          if (options?.capturedRscDataRef) {
+            options.capturedRscDataRef.value = capturedRscData;
+          }
+
+          return {
+            htmlStream: new ReadableStream<Uint8Array>({
+              cancel: cancelHtmlStream,
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode("<html>error boundary</html>"));
+                controller.close();
+              },
+            }),
+            metadataReady: Promise.resolve(),
+            capturedRscData,
+          };
+        },
+      }),
+      renderToReadableStream(_element, { onError }) {
+        capturedOnError = onError;
+        return createStream(["flight-data"]);
+      },
+      revalidateSeconds: 60,
+    });
+
+    await expect(responsePromise).rejects.toBe(renderError);
+    expect(cancelHtmlStream).toHaveBeenCalledOnce();
+    expect(clearRequestContext).toHaveBeenCalledOnce();
+    expect(common.isrSet).not.toHaveBeenCalled();
+  });
+
   it("does not cache HTML or RSC output when an ordinary RSC error occurs after the HTML shell", async () => {
     const common = createCommonOptions();
     const releasePostShellError = createDeferred();

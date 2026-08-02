@@ -1149,6 +1149,17 @@ export async function renderAppPageLifecycle(
       stopSpeculativeMetadataWaitOnDynamicUsage,
     );
   }
+  if (options.isPrerender === true) {
+    const capturedRscError = rscErrorTracker.getCapturedError();
+    if (capturedRscError !== null) {
+      // Full prerendering has settled the RSC render above, so publishing the
+      // error boundary's successful HTML response would persist a poisoned
+      // build artifact. Match static generation semantics by failing the render.
+      await htmlStream.cancel().catch(() => {});
+      options.clearRequestContext();
+      throw capturedRscError;
+    }
+  }
   if (shouldReadRequestCacheLifeForPrerender) {
     requestCacheLifeForPrerender = readRequestCacheLifeForPrerender(options);
     ({ expireSeconds, revalidateSeconds } = applyRequestCacheLife({
