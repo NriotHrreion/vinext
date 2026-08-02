@@ -321,6 +321,7 @@ describe("app page cache helpers", () => {
       expireSeconds: 31_536_000,
       revalidateSeconds: 60,
       renderFreshPageForCache: vi.fn(async () => ({
+        hasCapturedRenderError: false,
         html: "<h1>fresh</h1>",
         rscData: new ArrayBuffer(0),
         tags: [],
@@ -536,6 +537,7 @@ describe("app page cache helpers", () => {
       async renderFreshPageForCache() {
         didRenderFresh = true;
         return {
+          hasCapturedRenderError: false,
           html: "<h1>fresh</h1>",
           rscData: new ArrayBuffer(0),
           tags: [],
@@ -773,6 +775,7 @@ describe("app page cache helpers", () => {
       async renderFreshPageForCache() {
         return {
           cacheControl: { revalidate: 10, expire: 20 },
+          hasCapturedRenderError: false,
           html: "<h1>fresh</h1>",
           linkHeader: "</fresh.css>; rel=preload; as=style",
           rscData,
@@ -801,6 +804,52 @@ describe("app page cache helpers", () => {
         revalidateSeconds: 10,
       },
     ]);
+  });
+
+  it("preserves stale App Page entries when regeneration captures a render error", async () => {
+    const scheduledRegenerations: Array<() => Promise<void>> = [];
+    const debugCalls: Array<[string, string]> = [];
+    const isrSet = vi.fn();
+
+    const response = await readAppPageCacheResponse({
+      cleanPathname: "/stale-render-error",
+      clearRequestContext() {},
+      isRscRequest: false,
+      async isrGet() {
+        return buildISRCacheEntry(buildCachedAppPageValue("<h1>stale</h1>"), true);
+      },
+      isrDebug(event, detail) {
+        debugCalls.push([event, detail]);
+      },
+      isrHtmlKey(pathname) {
+        return "html:" + pathname;
+      },
+      isrRscKey(pathname) {
+        return "rsc:" + pathname;
+      },
+      isrSet,
+      revalidateSeconds: 60,
+      async renderFreshPageForCache() {
+        return {
+          hasCapturedRenderError: true,
+          html: "<h1>error fallback</h1>",
+          rscData: new TextEncoder().encode("error-flight").buffer,
+          tags: ["/stale-render-error", "_N_T_/stale-render-error"],
+        };
+      },
+      scheduleBackgroundRegeneration(_key, renderFn) {
+        scheduledRegenerations.push(renderFn);
+      },
+    });
+
+    expect(response?.headers.get("x-vinext-cache")).toBe("STALE");
+    await expect(response?.text()).resolves.toBe("<h1>stale</h1>");
+    expect(scheduledRegenerations).toHaveLength(1);
+
+    await expect(scheduledRegenerations[0]()).resolves.toBeUndefined();
+
+    expect(isrSet).not.toHaveBeenCalled();
+    expect(debugCalls).toContainEqual(["regen skipped (render error)", "/stale-render-error"]);
   });
 
   it("preserves route-level revalidate when regenerated App page fetches live longer", async () => {
@@ -836,6 +885,7 @@ describe("app page cache helpers", () => {
       async renderFreshPageForCache() {
         return {
           cacheControl: { revalidate: 9 },
+          hasCapturedRenderError: false,
           html: "<h1>fresh</h1>",
           rscData,
           tags: ["/config-and-fetch-revalidate", "_N_T_/config-and-fetch-revalidate"],
@@ -988,6 +1038,7 @@ describe("app page cache helpers", () => {
       revalidateSeconds: 60,
       async renderFreshPageForCache() {
         return {
+          hasCapturedRenderError: false,
           html: "<h1>fresh</h1>",
           rscData: new TextEncoder().encode("fresh-flight").buffer,
           tags: ["/stale-html-miss", "_N_T_/stale-html-miss"],
