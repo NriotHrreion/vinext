@@ -980,6 +980,9 @@ export async function renderAppPageLifecycle(
         isForceStatic: options.isForceStatic,
         revalidateSeconds,
       }),
+      hasCapturedRenderError() {
+        return rscErrorTracker.getCapturedError() !== null;
+      },
       waitUntil(promise) {
         options.waitUntil?.(promise);
       },
@@ -1289,6 +1292,9 @@ export async function renderAppPageLifecycle(
         isForceStatic: options.isForceStatic,
         revalidateSeconds,
       }),
+      hasCapturedRenderError() {
+        return rscErrorTracker.getCapturedError() !== null;
+      },
       waitUntil(cachePromise) {
         options.waitUntil?.(cachePromise);
       },

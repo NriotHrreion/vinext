@@ -804,6 +804,124 @@ describe("app page render lifecycle", () => {
     await expect(response.text()).resolves.toBe("<html>page</html>");
   });
 
+  // Next.js static generation and revalidation rethrow captured RSC errors
+  // before publishing an APP_PAGE cache entry:
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/app-render/app-render.tsx
+  // See also: https://github.com/cloudflare/vinext/issues/2783
+  it("does not cache HTML or RSC output when an ordinary RSC error occurs after the HTML shell", async () => {
+    const common = createCommonOptions();
+    const releasePostShellError = createDeferred();
+    const renderError = new Error("upstream failed");
+    let capturedOnError:
+      | ((error: unknown, requestInfo: unknown, errorContext: unknown) => unknown)
+      | undefined;
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      hasLoadingBoundary: true,
+      isProduction: true,
+      loadSsrHandler: async () => ({
+        async handleSsr(
+          _rscStream,
+          _navigationContext,
+          _fontData,
+          options?: {
+            capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
+            sideStream?: ReadableStream<Uint8Array>;
+          },
+        ) {
+          if (options?.capturedRscDataRef) {
+            options.capturedRscDataRef.value = Promise.resolve(
+              new TextEncoder().encode("flight-error").buffer,
+            );
+          }
+          if (options?.sideStream) {
+            void options.sideStream.getReader().cancel();
+          }
+
+          let shellSent = false;
+          return new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              if (!shellSent) {
+                shellSent = true;
+                controller.enqueue(new TextEncoder().encode("<html>shell"));
+                return;
+              }
+
+              await releasePostShellError.promise;
+              capturedOnError?.(renderError, null, null);
+              controller.enqueue(new TextEncoder().encode("</html>"));
+              controller.close();
+            },
+          });
+        },
+      }),
+      renderToReadableStream(_element, { onError }) {
+        capturedOnError = onError;
+        return createStream(["flight-data"]);
+      },
+      revalidateSeconds: 60,
+    });
+
+    const reader = response.body!.getReader();
+    const shell = await reader.read();
+    expect(new TextDecoder().decode(shell.value)).toBe("<html>shell");
+    expect(common.isrSet).not.toHaveBeenCalled();
+
+    releasePostShellError.resolve();
+    const closingChunk = await reader.read();
+    expect(new TextDecoder().decode(closingChunk.value)).toBe("</html>");
+    await expect(reader.read()).resolves.toEqual({ done: true, value: undefined });
+    await Promise.all(common.waitUntilPromises);
+
+    expect(common.isrSet).not.toHaveBeenCalled();
+  });
+
+  it("does not cache RSC output when an ordinary RSC error occurs after the Flight shell", async () => {
+    const common = createCommonOptions();
+    const releasePostShellError = createDeferred();
+    const renderError = new Error("upstream failed");
+    let capturedOnError:
+      | ((error: unknown, requestInfo: unknown, errorContext: unknown) => unknown)
+      | undefined;
+
+    const response = await renderAppPageLifecycle({
+      ...common.options,
+      hasLoadingBoundary: true,
+      isProduction: true,
+      isRscRequest: true,
+      renderToReadableStream(_element, { onError }) {
+        capturedOnError = onError;
+        let shellSent = false;
+        return new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (!shellSent) {
+              shellSent = true;
+              controller.enqueue(new TextEncoder().encode("flight-shell"));
+              return;
+            }
+
+            await releasePostShellError.promise;
+            capturedOnError?.(renderError, null, null);
+            controller.close();
+          },
+        });
+      },
+      revalidateSeconds: 60,
+    });
+
+    const reader = response.body!.getReader();
+    const shell = await reader.read();
+    expect(new TextDecoder().decode(shell.value)).toBe("flight-shell");
+    expect(common.isrSet).not.toHaveBeenCalled();
+
+    releasePostShellError.resolve();
+    await expect(reader.read()).resolves.toEqual({ done: true, value: undefined });
+    await Promise.all(common.waitUntilPromises);
+
+    expect(common.isrSet).not.toHaveBeenCalled();
+  });
+
   it("prefers the captured RSC error over an SSR decoder error when rendering the error boundary", async () => {
     const common = createCommonOptions();
     const rscError = new Error("rsc-original");

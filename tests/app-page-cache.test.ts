@@ -80,6 +80,16 @@ function buildQueryInvariantRenderObservation(): RenderObservation {
   });
 }
 
+function createDeferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, reject, resolve };
+}
+
 describe("app page cache helpers", () => {
   it("builds implicit page cache tags with unique extra tags", () => {
     expect(buildAppPageCacheTags("/blog/hello", ["custom", "_N_T_/blog/layout"])).toEqual([
@@ -1121,6 +1131,9 @@ describe("app page cache helpers", () => {
         getPageTags() {
           return ["/fresh", "_N_T_/fresh"];
         },
+        hasCapturedRenderError() {
+          return false;
+        },
         isrDebug(event, detail) {
           debugCalls.push([event, detail]);
         },
@@ -1180,6 +1193,72 @@ describe("app page cache helpers", () => {
     expect(debugCalls).toEqual([["HTML cache written", "html:/fresh"]]);
   });
 
+  it("checks for captured render errors after the HTML stream finishes", async () => {
+    const pendingCacheWrites: Promise<void>[] = [];
+    const releaseRenderError = createDeferred();
+    const isrSet = vi.fn();
+    let capturedRenderError = false;
+    let shellSent = false;
+
+    const response = finalizeAppPageHtmlCacheResponse(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (!shellSent) {
+              shellSent = true;
+              controller.enqueue(new TextEncoder().encode("<html>shell"));
+              return;
+            }
+
+            await releaseRenderError.promise;
+            capturedRenderError = true;
+            controller.enqueue(new TextEncoder().encode("</html>"));
+            controller.close();
+          },
+        }),
+      ),
+      {
+        capturedRscDataPromise: Promise.resolve(new TextEncoder().encode("flight-error").buffer),
+        cleanPathname: "/render-error-html",
+        consumeDynamicUsage() {
+          return false;
+        },
+        getPageTags() {
+          return ["/render-error-html"];
+        },
+        hasCapturedRenderError() {
+          return capturedRenderError;
+        },
+        isrHtmlKey(pathname) {
+          return "html:" + pathname;
+        },
+        isrRscKey(pathname) {
+          return "rsc:" + pathname;
+        },
+        isrSet,
+        revalidateSeconds: 60,
+        waitUntil(promise) {
+          pendingCacheWrites.push(promise);
+        },
+      },
+    );
+
+    const reader = response.body!.getReader();
+    const firstChunk = await reader.read();
+    expect(new TextDecoder().decode(firstChunk.value)).toBe("<html>shell");
+    expect(capturedRenderError).toBe(false);
+    expect(isrSet).not.toHaveBeenCalled();
+
+    releaseRenderError.resolve();
+    const secondChunk = await reader.read();
+    expect(new TextDecoder().decode(secondChunk.value)).toBe("</html>");
+    await expect(reader.read()).resolves.toEqual({ done: true, value: undefined });
+    await Promise.all(pendingCacheWrites);
+
+    expect(capturedRenderError).toBe(true);
+    expect(isrSet).not.toHaveBeenCalled();
+  });
+
   it("skips HTML and RSC cache writes when dynamic usage appears during stream rendering", async () => {
     const pendingCacheWrites: Promise<void>[] = [];
     const debugCalls: Array<[string, string]> = [];
@@ -1192,6 +1271,9 @@ describe("app page cache helpers", () => {
       },
       getPageTags() {
         return ["/dynamic-html", "_N_T_/dynamic-html"];
+      },
+      hasCapturedRenderError() {
+        return false;
       },
       isrDebug(event: string, detail: string) {
         debugCalls.push([event, detail]);
@@ -1260,6 +1342,9 @@ describe("app page cache helpers", () => {
         getPageTags() {
           return ["/dynamic-html-cleanup", "_N_T_/dynamic-html-cleanup"];
         },
+        hasCapturedRenderError() {
+          return false;
+        },
         isrDebug(event, detail) {
           debugCalls.push([event, detail]);
         },
@@ -1310,6 +1395,9 @@ describe("app page cache helpers", () => {
       getPageTags() {
         return ["/fresh-rsc", "_N_T_/fresh-rsc"];
       },
+      hasCapturedRenderError() {
+        return false;
+      },
       isrDebug(event, detail) {
         debugCalls.push([event, detail]);
       },
@@ -1351,6 +1439,47 @@ describe("app page cache helpers", () => {
     expect(debugCalls).toEqual([["RSC cache written", "rsc:/fresh-rsc"]]);
   });
 
+  it("checks for captured render errors after the RSC stream finishes", async () => {
+    const pendingCacheWrites: Promise<void>[] = [];
+    const capturedRscData = createDeferred<ArrayBuffer>();
+    const isrSet = vi.fn();
+    let capturedRenderError = false;
+
+    const didSchedule = scheduleAppPageRscCacheWrite({
+      capturedRscDataPromise: capturedRscData.promise,
+      cleanPathname: "/render-error-rsc",
+      consumeDynamicUsage() {
+        return false;
+      },
+      dynamicUsedDuringBuild: false,
+      getPageTags() {
+        return ["/render-error-rsc"];
+      },
+      hasCapturedRenderError() {
+        return capturedRenderError;
+      },
+      isrRscKey(pathname) {
+        return "rsc:" + pathname;
+      },
+      isrSet,
+      revalidateSeconds: 60,
+      waitUntil(promise) {
+        pendingCacheWrites.push(promise);
+      },
+    });
+
+    expect(didSchedule).toBe(true);
+    expect(pendingCacheWrites).toHaveLength(1);
+    expect(capturedRenderError).toBe(false);
+    expect(isrSet).not.toHaveBeenCalled();
+
+    capturedRenderError = true;
+    capturedRscData.resolve(new TextEncoder().encode("flight-error").buffer);
+    await Promise.all(pendingCacheWrites);
+
+    expect(isrSet).not.toHaveBeenCalled();
+  });
+
   it("skips persistent RSC cache writes for mounted-slot variants", async () => {
     const pendingCacheWrites: Promise<void>[] = [];
     const isrRscKey = vi.fn();
@@ -1365,6 +1494,9 @@ describe("app page cache helpers", () => {
       dynamicUsedDuringBuild: false,
       getPageTags() {
         return ["/fresh-rsc", "_N_T_/fresh-rsc"];
+      },
+      hasCapturedRenderError() {
+        return false;
       },
       isrRscKey,
       isrSet,
@@ -1402,6 +1534,9 @@ describe("app page cache helpers", () => {
         dynamicUsedDuringBuild: false,
         getPageTags() {
           return ["/fresh-rsc"];
+        },
+        hasCapturedRenderError() {
+          return false;
         },
         isrRscKey(pathname) {
           return "rsc:" + pathname;
@@ -1448,6 +1583,9 @@ describe("app page cache helpers", () => {
         getPageTags() {
           return ["/fresh-rsc"];
         },
+        hasCapturedRenderError() {
+          return false;
+        },
         isrRscKey(pathname) {
           return "rsc:" + pathname;
         },
@@ -1488,6 +1626,9 @@ describe("app page cache helpers", () => {
       getPageTags() {
         return ["/dynamic-rsc", "_N_T_/dynamic-rsc"];
       },
+      hasCapturedRenderError() {
+        return false;
+      },
       isrDebug(event, detail) {
         debugCalls.push([event, detail]);
       },
@@ -1526,6 +1667,9 @@ describe("app page cache helpers", () => {
       dynamicUsedDuringBuild: false,
       getPageTags() {
         return ["/invalid-cache-life"];
+      },
+      hasCapturedRenderError() {
+        return false;
       },
       getRequestCacheLife() {
         return { revalidate: Number.NaN };
