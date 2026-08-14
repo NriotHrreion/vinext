@@ -1317,6 +1317,7 @@ describe("app page cache helpers", () => {
         },
         isrSet,
         revalidateSeconds: 60,
+        linkHeader: null,
         waitUntil(promise) {
           pendingCacheWrites.push(promise);
         },
@@ -1627,6 +1628,9 @@ describe("app page cache helpers", () => {
         getPageTags() {
           return ["/fresh-rsc"];
         },
+        hasCapturedRenderError() {
+          return false;
+        },
         isrRscKey,
         isrSet,
         mountedSlotsHeader: "slot:auth:/",
@@ -1668,6 +1672,9 @@ describe("app page cache helpers", () => {
         dynamicUsedDuringBuild: true,
         getPageTags() {
           return ["/dynamic-rsc"];
+        },
+        hasCapturedRenderError() {
+          return false;
         },
         isrRscKey: vi.fn(),
         isrSet: vi.fn(),
