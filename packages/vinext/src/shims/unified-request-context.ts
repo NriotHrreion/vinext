@@ -115,6 +115,8 @@ export function createRequestContext(opts?: Partial<UnifiedRequestContext>): Uni
     unstableCacheObservations: new Map(),
     unstableCacheRevalidation: "foreground",
     _privateCache: null,
+    pendingCacheInvocations: null,
+    completedCacheInvocations: null,
     cacheableFetchUrls: new Set<string>(),
     currentRequestTags: [],
     currentFetchSoftTags: [],
@@ -379,7 +381,8 @@ export function runWithUnifiedStateMutation<T>(
   // serverInsertedHTMLCallbacks, currentRequestTags, ssrHeadChildren), Set
   // fields (renderRequestApiUsage, pendingRevalidatedTags, pendingRevalidations,
   // cacheableFetchUrls, dynamicFetchUrls),
-  // Map fields (unstableCacheObservations, _privateCache),
+  // Map fields (unstableCacheObservations, _privateCache,
+  // pendingCacheInvocations, completedCacheInvocations),
   // requestCache WeakMap, and object fields (headersContext,
   // i18nContext, serverContext, ssrContext, executionContext,
   // requestScopedCacheLife) still share references with the parent until
