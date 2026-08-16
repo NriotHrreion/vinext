@@ -413,93 +413,85 @@ type CacheInvocationResult = {
   metadata: CacheInvocationMetadata;
 };
 
-export type PrivateCacheState = {
-  _privateCache: Map<string, unknown> | null;
+export type CacheInvocationState = {
   pendingCacheInvocations: Map<string, Promise<CacheInvocationResult>> | null;
   completedCacheInvocations: Map<string, Promise<CacheInvocationResult>> | null;
 };
 
-const _PRIVATE_FALLBACK_KEY = Symbol.for("vinext.cacheRuntime.privateFallback");
+// Keep the registry identifiers stable across HMR and separately bundled Vite
+// environments; the state they point to now contains invocation maps only.
+const _INVOCATION_FALLBACK_KEY = Symbol.for("vinext.cacheRuntime.privateFallback");
 const _g = globalThis as unknown as Record<PropertyKey, unknown>;
-const _privateAls = getOrCreateAls<PrivateCacheState>("vinext.cacheRuntime.privateAls");
+const _invocationAls = getOrCreateAls<CacheInvocationState>("vinext.cacheRuntime.privateAls");
 
-const _privateFallbackState = (_g[_PRIVATE_FALLBACK_KEY] ??= {
-  _privateCache: new Map<string, unknown>(),
+const _invocationFallbackState = (_g[_INVOCATION_FALLBACK_KEY] ??= {
   pendingCacheInvocations: new Map<string, Promise<CacheInvocationResult>>(),
   completedCacheInvocations: new Map<string, Promise<CacheInvocationResult>>(),
-} satisfies PrivateCacheState) as PrivateCacheState;
-_privateFallbackState.pendingCacheInvocations ??= new Map();
-_privateFallbackState.completedCacheInvocations ??= new Map();
+} satisfies CacheInvocationState) as CacheInvocationState;
+_invocationFallbackState.pendingCacheInvocations ??= new Map();
+_invocationFallbackState.completedCacheInvocations ??= new Map();
 
-function _getPrivateState(): PrivateCacheState {
+function _getInvocationState(): CacheInvocationState {
   if (isInsideUnifiedScope()) {
     const ctx = getRequestContext();
-    if (ctx._privateCache === null) {
-      ctx._privateCache = new Map();
-    }
     ctx.pendingCacheInvocations ??= new Map();
     ctx.completedCacheInvocations ??= new Map();
     return ctx;
   }
-  return _privateAls.getStore() ?? _privateFallbackState;
+  return _invocationAls.getStore() ?? _invocationFallbackState;
 }
 
-function _getRequestScopedInvocationState(cacheVariant: string): PrivateCacheState | null {
-  if (isInsideUnifiedScope()) return _getPrivateState();
+function _getRequestScopedInvocationState(cacheVariant: string): CacheInvocationState | null {
+  if (isInsideUnifiedScope()) return _getInvocationState();
 
-  const privateState = _privateAls.getStore();
-  if (privateState) return privateState;
+  const invocationState = _invocationAls.getStore();
+  if (invocationState) return invocationState;
 
   // Preserve the legacy direct-call behavior of "use cache: private", but do
   // not retain public invocations in process-global fallback state. Public
   // invocation maps are meaningful only when a request scope owns them.
-  return cacheVariant === "private" ? _privateFallbackState : null;
+  return cacheVariant === "private" ? _invocationFallbackState : null;
 }
 
 /**
- * Run a function within a private cache ALS scope.
- * Ensures per-request isolation for "use cache: private" entries
- * on concurrent runtimes.
+ * Run a function within a request-scoped cache invocation ALS scope.
+ * The legacy export name is retained for generated Pages Router entries.
  */
 export function runWithPrivateCache<T>(fn: () => Promise<T>): Promise<T>;
 export function runWithPrivateCache<T>(fn: () => T | Promise<T>): T | Promise<T>;
 export function runWithPrivateCache<T>(fn: () => T | Promise<T>): T | Promise<T> {
   if (isInsideUnifiedScope()) {
     return runWithUnifiedStateMutation((uCtx) => {
-      uCtx._privateCache = new Map();
       uCtx.pendingCacheInvocations = new Map();
       uCtx.completedCacheInvocations = new Map();
     }, fn);
   }
-  const state: PrivateCacheState = {
-    _privateCache: new Map(),
+  const state: CacheInvocationState = {
     pendingCacheInvocations: new Map(),
     completedCacheInvocations: new Map(),
   };
-  return _privateAls.run(state, fn);
+  return _invocationAls.run(state, fn);
 }
 
 /**
- * Clear the private per-request cache. Should be called at the start of each request.
- * Only needed when not using runWithPrivateCache() (legacy path).
+ * Clear request-scoped cache invocations. Only needed when not using
+ * runWithPrivateCache() (legacy path); the export name is retained for
+ * compatibility with existing callers.
  */
 export function clearPrivateCache(): void {
   if (isInsideUnifiedScope()) {
     const context = getRequestContext();
-    context._privateCache = new Map();
     context.pendingCacheInvocations = new Map();
     context.completedCacheInvocations = new Map();
     return;
   }
-  const state = _privateAls.getStore();
+  const state = _invocationAls.getStore();
   if (state) {
-    state._privateCache = new Map();
     state.pendingCacheInvocations = new Map();
     state.completedCacheInvocations = new Map();
   } else {
-    _privateFallbackState._privateCache = new Map();
-    _privateFallbackState.pendingCacheInvocations = new Map();
-    _privateFallbackState.completedCacheInvocations = new Map();
+    _invocationFallbackState.pendingCacheInvocations = new Map();
+    _invocationFallbackState.completedCacheInvocations = new Map();
   }
 }
 
