@@ -180,6 +180,9 @@
     "@vinext/types": "workspace:^",
     "ipaddr.js": "catalog:",
     "magic-string": "catalog:",
+    "postcss": "catalog:",
+    "postcss-extend-rule": "4.0.0",
+    "postcss-preset-env": "11.4.0",
     "vite-plugin-commonjs": "catalog:",
     "web-vitals": "catalog:"
   },
@@ -192,9 +195,6 @@
     "am-i-vibing": "catalog:",
     "image-size": "catalog:",
     "pathslash": "catalog:",
-    "postcss": "catalog:",
-    "postcss-extend-rule": "4.0.0",
-    "postcss-preset-env": "11.4.0",
     "react-server-dom-webpack": "catalog:",
     "vite": "catalog:",
     "vite-plus": "catalog:"
