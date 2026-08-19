@@ -1449,22 +1449,24 @@ function createExpandCSSModuleExtendsPlugin(): Plugin {
   return {
     name: "expand-css-module-extends-plugin",
     enforce: "pre",
-    async transform(code: string, id: string) {
-      const file = id.split("?")[0];
-      if (!file.endsWith(".module.css") || !code.includes("@extend")) return null;
-      if (!processor) {
-        const postcss = (await import("postcss")).default;
-        const extendRule = (await import("postcss-extend-rule")).default;
-        const presetEnv = (await import("postcss-preset-env")).default;
-        // `@extend` must see flat selectors: postcss-extend-rule skips nested
-        // rules whose selector it cannot resolve, so flatten nesting first.
-        processor = postcss([
-          presetEnv({ stage: false, features: { "nesting-rules": true } }),
-          extendRule(),
-        ]);
-      }
-      const result = await processor.process(code, { from: file });
-      return { code: result.css, map: null };
+    transform: {
+      filter: { id: /\.module\.css(?:\?.*)?$/, code: "@extend" },
+      async handler(code: string, id: string) {
+        const file = id.split("?")[0];
+        if (!processor) {
+          const postcss = (await import("postcss")).default;
+          const extendRule = (await import("postcss-extend-rule")).default;
+          const presetEnv = (await import("postcss-preset-env")).default;
+          // `@extend` must see flat selectors: postcss-extend-rule skips nested
+          // rules whose selector it cannot resolve, so flatten nesting first.
+          processor = postcss([
+            presetEnv({ stage: false, features: { "nesting-rules": true } }),
+            extendRule(),
+          ]);
+        }
+        const result = await processor.process(code, { from: file });
+        return { code: result.css, map: null };
+      },
     },
   };
 }
