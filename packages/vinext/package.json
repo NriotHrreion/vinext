@@ -192,6 +192,9 @@
     "am-i-vibing": "catalog:",
     "image-size": "catalog:",
     "pathslash": "catalog:",
+    "postcss": "catalog:",
+    "postcss-extend-rule": "4.0.0",
+    "postcss-preset-env": "11.4.0",
     "react-server-dom-webpack": "catalog:",
     "vite": "catalog:",
     "vite-plus": "catalog:"
