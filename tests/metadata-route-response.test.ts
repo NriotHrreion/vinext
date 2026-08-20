@@ -368,6 +368,54 @@ describe("handleMetadataRouteRequest", () => {
     ]);
   });
 
+  it("skips metadata routes with dynamic = 'force-dynamic' when enumerating prerender paths", async () => {
+    const routes = [
+      {
+        type: "robots",
+        isDynamic: true,
+        filePath: "/tmp/app/robots.ts",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/robots.txt",
+        contentType: "text/plain",
+        module: {
+          dynamic: "force-dynamic",
+          default: async () => {
+            throw new Error(
+              "force-dynamic metadata route must not execute during prerender enumeration",
+            );
+          },
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([]);
+  });
+
+  it("skips metadata routes with revalidate = 0 when enumerating prerender paths", async () => {
+    const routes = [
+      {
+        type: "icon",
+        isDynamic: true,
+        filePath: "/tmp/app/icon.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/icon",
+        contentType: "image/png",
+        module: {
+          revalidate: 0,
+          default: async () => {
+            throw new Error(
+              "revalidate=0 metadata route must not execute during prerender enumeration",
+            );
+          },
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([]);
+  });
+
   it("publishes collected cache tags for prerender seeding", async () => {
     const response = await withEnvVar("VINEXT_PRERENDER", "1", () =>
       runWithRequestContext(createRequestContext(), () =>

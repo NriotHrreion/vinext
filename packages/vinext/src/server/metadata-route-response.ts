@@ -199,6 +199,17 @@ function getMetadataRouteFunctions(route: MetadataRuntimeRoute): MetadataRouteFu
   return functions;
 }
 
+function isMetadataRouteDynamic(route: MetadataRuntimeRoute, dynamicDetected: boolean): boolean {
+  const module = route.module ?? {};
+
+  // `export const dynamic = "force-dynamic"` forces the route to be dynamic.
+  if (Reflect.get(module, "dynamic") === "force-dynamic") return true;
+
+  // `export const revalidate = 0` means "never cache",
+  // so treat it the same as force-dynamic.
+  return Reflect.get(module, "revalidate") === 0 || dynamicDetected;
+}
+
 /**
  * Enumerate metadata URLs whose default export is an explicit public
  * `"use cache"` function. These are safe to invoke during prerendering and the
@@ -210,7 +221,8 @@ export async function getPrerenderableMetadataRoutePaths(
   const paths: PrerenderableMetadataRoute[] = [];
 
   for (const route of metadataRoutes) {
-    if (!route.isDynamic || route.servedUrl.includes("[")) continue;
+    if (!route.isDynamic || route.servedUrl.includes("[") || isMetadataRouteDynamic(route, false))
+      continue;
 
     const functions = getMetadataRouteFunctions(route);
     if (!functions.defaultExport) continue;
@@ -322,17 +334,6 @@ function isRenderedMetadataRouteCacheable(rendered: RenderedMetadataRoute): bool
   return (
     rendered.response.ok && !rendered.dynamic && isMetadataResponseCacheable(rendered.response)
   );
-}
-
-function isMetadataRouteDynamic(route: MetadataRuntimeRoute, dynamicDetected: boolean): boolean {
-  const module = route.module ?? {};
-
-  // `export const dynamic = "force-dynamic"` forces the route to be dynamic.
-  if (Reflect.get(module, "dynamic") === "force-dynamic") return true;
-
-  // `export const revalidate = 0` means "never cache",
-  // so treat it the same as force-dynamic.
-  return Reflect.get(module, "revalidate") === 0 || dynamicDetected;
 }
 
 async function writeRenderedMetadataRoute(
