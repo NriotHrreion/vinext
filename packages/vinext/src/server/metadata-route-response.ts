@@ -44,6 +44,7 @@ import { VINEXT_METADATA_ROUTE_CACHE_HEADER } from "./headers.js";
 import { isMetadataResponseCacheable } from "./metadata-route-cache-policy.js";
 import { applyCdnResponseHeaders, NEVER_CACHE_CONTROL } from "./cache-control.js";
 import { runWithIsolatedDynamicUsage } from "vinext/shims/headers.js";
+import { makeThenableParams } from "vinext/shims/thenable-params";
 
 type AppPageParams = Record<string, string | string[]>;
 type MetadataRouteFunction = (props: Record<string, unknown>) => unknown;
@@ -262,7 +263,7 @@ export async function getPrerenderableMetadataRoutePaths(
     }
 
     if (isImageMetadataRoute(route) && functions.generateImageMetadata) {
-      const entries = await functions.generateImageMetadata({});
+      const entries = await functions.generateImageMetadata({ params: makeThenableParams({}) });
       if (!Array.isArray(entries)) continue;
       for (const entry of entries) {
         if (!isObject(entry) || Reflect.get(entry, "id") == null) {
