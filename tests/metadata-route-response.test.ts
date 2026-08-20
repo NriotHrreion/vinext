@@ -307,6 +307,78 @@ describe("handleMetadataRouteRequest", () => {
     });
   }
 
+  it("treats metadata routes with dynamic = 'force-dynamic' as explicitly dynamic", async () => {
+    let outerWrites = 0;
+    const response = await handleMetadataRouteRequest({
+      cleanPathname: "/robots.txt",
+      async isrGet() {
+        return null;
+      },
+      isrRouteKey: (pathname) => pathname,
+      async isrSet() {
+        outerWrites++;
+      },
+      makeThenableParams,
+      metadataRoutes: [
+        {
+          type: "robots",
+          isDynamic: true,
+          filePath: "/tmp/app/robots.ts",
+          routePrefix: "",
+          routeSegments: [],
+          servedUrl: "/robots.txt",
+          contentType: "text/plain",
+          module: {
+            dynamic: "force-dynamic",
+            default: markUseCache(async () => ({ rules: { userAgent: "*" } })),
+          },
+        },
+      ],
+    });
+
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get("cache-control")).toBe(
+      "private, no-cache, no-store, max-age=0, must-revalidate",
+    );
+    expect(outerWrites).toBe(0);
+  });
+
+  it("treats metadata routes with revalidate = 0 as explicitly dynamic", async () => {
+    let outerWrites = 0;
+    const response = await handleMetadataRouteRequest({
+      cleanPathname: "/robots.txt",
+      async isrGet() {
+        return null;
+      },
+      isrRouteKey: (pathname) => pathname,
+      async isrSet() {
+        outerWrites++;
+      },
+      makeThenableParams,
+      metadataRoutes: [
+        {
+          type: "robots",
+          isDynamic: true,
+          filePath: "/tmp/app/robots.ts",
+          routePrefix: "",
+          routeSegments: [],
+          servedUrl: "/robots.txt",
+          contentType: "text/plain",
+          module: {
+            revalidate: 0,
+            default: markUseCache(async () => ({ rules: { userAgent: "*" } })),
+          },
+        },
+      ],
+    });
+
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get("cache-control")).toBe(
+      "private, no-cache, no-store, max-age=0, must-revalidate",
+    );
+    expect(outerWrites).toBe(0);
+  });
+
   it("does not replay a colliding unmarked App Route cache entry", async () => {
     let metadataCalls = 0;
     const response = await handleMetadataRouteRequest({
