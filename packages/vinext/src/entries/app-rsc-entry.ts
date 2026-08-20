@@ -1370,7 +1370,6 @@ const __appRscHandler = createAppRscHandler({
       isrSet: __isrSet,
       makeThenableParams,
       scheduleBackgroundRegeneration: __triggerBackgroundRegeneration,
-      consumeDynamicUsage,
     });
   },`
       : ""

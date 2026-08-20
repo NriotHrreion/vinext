@@ -75,7 +75,6 @@ type MetadataRouteRequestOptions = {
   isrSet?: MetadataRouteCacheSetter;
   makeThenableParams: MetadataRouteMakeThenableParams;
   scheduleBackgroundRegeneration?: MetadataRouteBackgroundRegenerator;
-  consumeDynamicUsasge?: () => boolean;
 };
 
 type MatchedMetadataRoute = {
