@@ -23,6 +23,7 @@ import {
 } from "./app-route-handler-response.js";
 import {
   _consumeRequestScopedCacheLife,
+  _setRequestScopedCacheLife,
   cacheLifeProfiles,
   type CacheLifeConfig,
 } from "vinext/shims/cache-request-state";
@@ -208,6 +209,20 @@ function isMetadataRouteDynamic(route: MetadataRuntimeRoute, dynamicDetected: bo
   // `export const revalidate = 0` means "never cache",
   // so treat it the same as force-dynamic.
   return Reflect.get(module, "revalidate") === 0 || dynamicDetected;
+}
+
+/**
+ * If the metadata module exports a finite positive `revalidate` interval, push
+ * it into the request-scoped cacheLife so that prerender seeding and runtime
+ * ISR writes use the requested TTL instead of the default profile.
+ */
+function applyMetadataRouteRevalidate(route: MetadataRuntimeRoute): void {
+  const module = route.module ?? {};
+  const revalidate = Reflect.get(module, "revalidate");
+
+  if (typeof revalidate === "number" && Number.isFinite(revalidate) && revalidate > 0) {
+    _setRequestScopedCacheLife({ revalidate });
+  }
 }
 
 /**
@@ -778,6 +793,7 @@ export async function handleMetadataRouteRequest(
         if (isGeneratedSitemapPath(route, options.cleanPathname)) {
           const render = async (): Promise<RenderedMetadataRoute | null> => {
             setCurrentFetchSoftTags(buildMetadataRouteTags(route, options.cleanPathname, []));
+            applyMetadataRouteRevalidate(route);
 
             const { result: response, dynamicDetected } = await runWithIsolatedDynamicUsage(
               async () => await handleGeneratedSitemap(route, options.cleanPathname, functions),
@@ -813,6 +829,7 @@ export async function handleMetadataRouteRequest(
 
     const render = async (): Promise<RenderedMetadataRoute> => {
       setCurrentFetchSoftTags(buildMetadataRouteTags(route, options.cleanPathname, []));
+      applyMetadataRouteRevalidate(route);
 
       const { result: response, dynamicDetected } = await runWithIsolatedDynamicUsage(async () =>
         route.isDynamic

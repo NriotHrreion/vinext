@@ -18,6 +18,7 @@ import {
   runWithRequestContext,
 } from "../packages/vinext/src/shims/unified-request-context.js";
 import { registerCachedFunction } from "../packages/vinext/src/shims/cache-runtime.js";
+import type { IsrWritePolicy } from "../packages/vinext/src/server/isr-cache.js";
 import { createIsolatedFixture } from "./helpers.js";
 
 type MetadataRuntimeRoute = MetadataFileRoute & {
@@ -445,6 +446,92 @@ describe("handleMetadataRouteRequest", () => {
     );
 
     expect(response?.headers.get("x-next-cache-tags")).toBe("metadata-user-tag");
+  });
+
+  it("still enumerates metadata routes with a positive revalidate for prerendering", async () => {
+    const routes = [
+      {
+        type: "robots",
+        isDynamic: true,
+        filePath: "/tmp/app/robots.ts",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/robots.txt",
+        contentType: "text/plain",
+        module: {
+          revalidate: 60,
+          default: async () => ({ rules: { userAgent: "*" } }),
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([
+      { path: "/robots.txt", routePattern: "/robots.txt", routeSegments: [] },
+    ]);
+  });
+
+  it("applies exported revalidate interval to metadata prerender cache life header", async () => {
+    const response = await withEnvVar("VINEXT_PRERENDER", "1", () =>
+      runWithRequestContext(createRequestContext(), () =>
+        handleMetadataRouteRequest({
+          cleanPathname: "/robots.txt",
+          makeThenableParams,
+          metadataRoutes: [
+            {
+              type: "robots",
+              isDynamic: true,
+              filePath: "/tmp/app/robots.ts",
+              routePrefix: "",
+              routeSegments: [],
+              servedUrl: "/robots.txt",
+              contentType: "text/plain",
+              module: {
+                revalidate: 60,
+                default: async () => ({ rules: { userAgent: "*" } }),
+              },
+            },
+          ],
+        }),
+      ),
+    );
+
+    expect(response?.headers.get("x-vinext-prerender-cache-life")).toBe(
+      JSON.stringify({ revalidate: 60 }),
+    );
+  });
+
+  it("applies exported revalidate interval to metadata runtime cache write policy", async () => {
+    const writes: IsrWritePolicy[] = [];
+    const response = await handleMetadataRouteRequest({
+      cleanPathname: "/robots.txt",
+      isrRouteKey: (pathname) => pathname,
+      async isrGet() {
+        return null;
+      },
+      async isrSet(_key, _value, policy) {
+        writes.push(policy);
+      },
+      makeThenableParams,
+      metadataRoutes: [
+        {
+          type: "robots",
+          isDynamic: true,
+          filePath: "/tmp/app/robots.ts",
+          routePrefix: "",
+          routeSegments: [],
+          servedUrl: "/robots.txt",
+          contentType: "text/plain",
+          module: {
+            revalidate: 60,
+            default: async () => ({ rules: { userAgent: "*" } }),
+          },
+        },
+      ],
+    });
+
+    expect(response?.status).toBe(200);
+    expect(writes).toHaveLength(1);
+    expect(writes[0].cacheControl.revalidate).toBe(60);
   });
 
   it("does not replay an unrelated cached App Route response as metadata", async () => {
