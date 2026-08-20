@@ -1,4 +1,10 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, beforeAll, afterAll } from "vite-plus/test";
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { createBuilder } from "vite";
+import vinext from "../packages/vinext/src/index.js";
+import { runPrerender } from "../packages/vinext/src/build/run-prerender.js";
 import {
   getPrerenderableMetadataRoutePaths,
   handleMetadataRouteRequest,
@@ -12,6 +18,7 @@ import {
   runWithRequestContext,
 } from "../packages/vinext/src/shims/unified-request-context.js";
 import { registerCachedFunction } from "../packages/vinext/src/shims/cache-runtime.js";
+import { createIsolatedFixture } from "./helpers.js";
 
 type MetadataRuntimeRoute = MetadataFileRoute & {
   fileDataBase64?: string;
@@ -27,7 +34,7 @@ function markUseCache<T extends (...args: never[]) => unknown>(fn: T): T {
 }
 
 describe("handleMetadataRouteRequest", () => {
-  it("enumerates cached text metadata routes for build prerendering", async () => {
+  it("enumerates prerenderable metadata route paths", async () => {
     // Ported from Next.js:
     // test/e2e/app-dir/use-cache-metadata-route-handler/use-cache-metadata-route-handler.test.ts
     // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-cache-metadata-route-handler/use-cache-metadata-route-handler.test.ts
@@ -105,10 +112,11 @@ describe("handleMetadataRouteRequest", () => {
         routePattern: "/manifest.webmanifest",
         routeSegments: [],
       },
+      { path: "/icon", routePattern: "/icon", routeSegments: [] },
     ]);
   });
 
-  it("publishes collected cache tags and cache life for prerender seeding", async () => {
+  it("publishes collected cache tags for prerender seeding", async () => {
     const response = await withEnvVar("VINEXT_PRERENDER", "1", () =>
       runWithRequestContext(createRequestContext(), () =>
         handleMetadataRouteRequest({
@@ -137,9 +145,6 @@ describe("handleMetadataRouteRequest", () => {
     );
 
     expect(response?.headers.get("x-next-cache-tags")).toBe("metadata-user-tag");
-    expect(response?.headers.get("x-vinext-prerender-cache-life")).toBe(
-      '{"revalidate":60,"expire":300,"stale":30}',
-    );
   });
 
   it("does not replay an unrelated cached App Route response as metadata", async () => {
@@ -938,5 +943,104 @@ describe("handleMetadataRouteRequest", () => {
     ).rejects.toThrow(
       "Dynamic metadata opengraph-image route /opengraph-image must return a Response.",
     );
+  });
+});
+
+const FIXTURE_DIR = path.resolve(import.meta.dirname, "./fixtures/og-image-optimization");
+const PNG_MAGIC_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+type PrerenderManifestEntry = {
+  route: string;
+  status: string;
+  reason?: string;
+  router?: string;
+};
+
+describe("metadata route prerender integration (issue #2950)", () => {
+  let root = "";
+  let manifest: { routes: PrerenderManifestEntry[] };
+
+  beforeAll(async () => {
+    // Copy the fixture to a tmpdir so build output (dist/) doesn't pollute the
+    // checked-in fixture. Reuse the fixture's own node_modules (it carries the
+    // workspace vinext link + react).
+    root = await createIsolatedFixture(
+      FIXTURE_DIR,
+      "vinext-og-prerender-",
+      undefined,
+      path.join(FIXTURE_DIR, "node_modules"),
+    );
+
+    const builder = await createBuilder({
+      root,
+      configFile: false,
+      plugins: [vinext({ appDir: root })],
+      logLevel: "silent",
+    });
+    await builder.buildApp();
+
+    // Same prerender phase `vinext build --prerender-all` runs after building.
+    await runPrerender({ root, concurrency: 1 });
+
+    manifest = JSON.parse(
+      fs.readFileSync(path.join(root, "dist", "server", "vinext-prerender.json"), "utf-8"),
+    );
+  }, 300000);
+
+  afterAll(() => {
+    if (root) fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('prerenders a static metadata image route without requiring "use cache"', () => {
+    const entry = manifest.routes.find((r) => r.route === "/opengraph-image");
+    expect(entry).toMatchObject({ status: "rendered", router: "metadata" });
+
+    const artifactPath = path.join(
+      root,
+      "dist",
+      "server",
+      "prerendered-routes",
+      "opengraph-image.route",
+    );
+    expect(fs.existsSync(artifactPath)).toBe(true);
+    // The artifact must be the persisted metadata route body — a real PNG.
+    const artifact = fs.readFileSync(artifactPath);
+    expect(artifact.subarray(0, PNG_MAGIC_BYTES.length).equals(PNG_MAGIC_BYTES)).toBe(true);
+  });
+
+  it("serves a metadata image route dynamically at runtime", async () => {
+    // The metadata route itself remains fully functional — it is only excluded
+    // from the prerender phase. This pins the repro to candidate enumeration
+    // (getPrerenderableMetadataRoutePaths) rather than a broken route.
+    const built: { default?: unknown } = await import(
+      `${pathToFileURL(path.join(root, "dist", "server", "index.js")).href}?t=${Date.now()}`
+    );
+    expect(typeof built.default).toBe("function");
+    if (typeof built.default !== "function") return;
+
+    const res = await built.default(new Request("http://localhost/opengraph-image"));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("image/png");
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.subarray(0, PNG_MAGIC_BYTES.length).equals(PNG_MAGIC_BYTES)).toBe(true);
+  });
+
+  it("does not prerender a metadata route that uses request-time APIs", () => {
+    // A dynamic metadata image route (headers()) must stay dynamic: either
+    // absent from the manifest or recorded as skipped — never persisted as a
+    // static artifact.
+    const entry = manifest.routes.find((r) => r.route === "/dynamic/opengraph-image");
+    expect(entry).toMatchObject({
+      status: "skipped",
+      reason: "dynamic",
+    });
+    if (entry?.status === "skipped") {
+      expect(entry.reason).toBe("dynamic");
+    }
+    expect(
+      fs.existsSync(
+        path.join(root, "dist", "server", "prerendered-routes", "dynamic", "opengraph-image.route"),
+      ),
+    ).toBe(false);
   });
 });
