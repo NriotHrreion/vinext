@@ -116,6 +116,258 @@ describe("handleMetadataRouteRequest", () => {
     ]);
   });
 
+  it("enumerates generated image metadata ids for prerendering", async () => {
+    const routes = [
+      {
+        type: "icon",
+        isDynamic: true,
+        filePath: "/tmp/app/icon.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/icon",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => [{ id: "small" }, { id: "large" }],
+          default: async () => new Response("icon"),
+        },
+      },
+      {
+        type: "opengraph-image",
+        isDynamic: true,
+        filePath: "/tmp/app/opengraph-image.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/opengraph-image",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => [{ id: "default" }],
+          default: async () => new Response("og"),
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([
+      { path: "/icon/small", routePattern: "/icon", routeSegments: [] },
+      { path: "/icon/large", routePattern: "/icon", routeSegments: [] },
+      { path: "/opengraph-image/default", routePattern: "/opengraph-image", routeSegments: [] },
+    ]);
+  });
+
+  it("skips invalid generated image metadata ids when enumerating prerender paths", async () => {
+    const routes = [
+      {
+        type: "icon",
+        isDynamic: true,
+        filePath: "/tmp/app/icon.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/icon",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => [
+            { id: "valid" },
+            { id: "bad/id" },
+            { id: "" },
+            { id: "bad id" },
+            { id: "bad:id" },
+            { id: "also-valid" },
+            { id: "unicode-\u4e2d\u6587" },
+          ],
+          default: async () => new Response("icon"),
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([
+      { path: "/icon/valid", routePattern: "/icon", routeSegments: [] },
+      { path: "/icon/also-valid", routePattern: "/icon", routeSegments: [] },
+    ]);
+  });
+
+  it("throws when generateImageMetadata returns an entry without id", async () => {
+    const routes = [
+      {
+        type: "icon",
+        isDynamic: true,
+        filePath: "/tmp/app/icon.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/icon",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => [{}],
+          default: async () => new Response("icon"),
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).rejects.toThrow(
+      "id property is required for every item returned from generateImageMetadata",
+    );
+  });
+
+  it("skips metadata image routes with dynamic segments when enumerating prerender paths", async () => {
+    const routes = [
+      {
+        type: "opengraph-image",
+        isDynamic: true,
+        filePath: "/tmp/app/blog/[slug]/opengraph-image.tsx",
+        routePrefix: "/blog/[slug]",
+        routeSegments: ["blog", "[slug]"],
+        servedUrl: "/blog/[slug]/opengraph-image",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => [{ id: "default" }],
+          default: async () => new Response("og"),
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([]);
+  });
+
+  it("skips metadata image routes whose generateImageMetadata returns a non-array", async () => {
+    const routes = [
+      {
+        type: "icon",
+        isDynamic: true,
+        filePath: "/tmp/app/icon.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/icon",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => null,
+          default: async () => new Response("icon"),
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([]);
+  });
+
+  it("returns no paths for metadata image routes with empty generateImageMetadata", async () => {
+    const routes = [
+      {
+        type: "icon",
+        isDynamic: true,
+        filePath: "/tmp/app/icon.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/icon",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => [],
+          default: async () => new Response("icon"),
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([]);
+  });
+
+  it("preserves valid special characters in generated image metadata ids", async () => {
+    const routes = [
+      {
+        type: "icon",
+        isDynamic: true,
+        filePath: "/tmp/app/icon.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/icon",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => [{ id: "my.id" }, { id: "my_id" }, { id: "my-id" }],
+          default: async () => new Response("icon"),
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([
+      { path: "/icon/my.id", routePattern: "/icon", routeSegments: [] },
+      { path: "/icon/my_id", routePattern: "/icon", routeSegments: [] },
+      { path: "/icon/my-id", routePattern: "/icon", routeSegments: [] },
+    ]);
+  });
+
+  it("skips metadata image routes without a default export", async () => {
+    const routes = [
+      {
+        type: "icon",
+        isDynamic: true,
+        filePath: "/tmp/app/icon.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/icon",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => [{ id: "small" }],
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([]);
+  });
+
+  it("enumerates numeric generated image metadata ids", async () => {
+    const routes = [
+      {
+        type: "icon",
+        isDynamic: true,
+        filePath: "/tmp/app/icon.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/icon",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => [{ id: 0 }, { id: 1 }],
+          default: async () => new Response("icon"),
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([
+      { path: "/icon/0", routePattern: "/icon", routeSegments: [] },
+      { path: "/icon/1", routePattern: "/icon", routeSegments: [] },
+    ]);
+  });
+
+  it("enumerates generated image metadata ids for all image route types", async () => {
+    const routes = [
+      {
+        type: "apple-icon",
+        isDynamic: true,
+        filePath: "/tmp/app/apple-icon.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/apple-icon",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => [{ id: "touch" }],
+          default: async () => new Response("apple-icon"),
+        },
+      },
+      {
+        type: "twitter-image",
+        isDynamic: true,
+        filePath: "/tmp/app/twitter-image.tsx",
+        routePrefix: "",
+        routeSegments: [],
+        servedUrl: "/twitter-image",
+        contentType: "image/png",
+        module: {
+          generateImageMetadata: async () => [{ id: "card" }],
+          default: async () => new Response("twitter-image"),
+        },
+      },
+    ] satisfies MetadataFileRoute[];
+
+    await expect(getPrerenderableMetadataRoutePaths(routes)).resolves.toEqual([
+      { path: "/apple-icon/touch", routePattern: "/apple-icon", routeSegments: [] },
+      { path: "/twitter-image/card", routePattern: "/twitter-image", routeSegments: [] },
+    ]);
+  });
+
   it("publishes collected cache tags for prerender seeding", async () => {
     const response = await withEnvVar("VINEXT_PRERENDER", "1", () =>
       runWithRequestContext(createRequestContext(), () =>

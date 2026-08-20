@@ -215,30 +215,50 @@ export async function getPrerenderableMetadataRoutePaths(
     const functions = getMetadataRouteFunctions(route);
     if (!functions.defaultExport) continue;
 
-    if (route.type !== "sitemap" || !functions.generateSitemaps) {
-      paths.push({
-        path: route.servedUrl,
-        routePattern: route.servedUrl,
-        routeSegments: route.routeSegments ?? [],
-      });
+    if (route.type === "sitemap" && functions.generateSitemaps) {
+      const entries = await functions.generateSitemaps({});
+      if (!Array.isArray(entries)) continue;
+      const sitemapPrefix = route.servedUrl.slice(0, -4);
+      for (const entry of entries) {
+        if (!isObject(entry) || Reflect.get(entry, "id") == null) {
+          throw new Error("id property is required for every item returned from generateSitemaps");
+        }
+        const id = String(Reflect.get(entry, "id"));
+        if (!id || id.includes("/")) continue;
+        paths.push({
+          path: `${sitemapPrefix}/${encodeURIComponent(id)}.xml`,
+          routePattern: route.servedUrl,
+          routeSegments: route.routeSegments ?? [],
+        });
+      }
       continue;
     }
 
-    const entries = await functions.generateSitemaps({});
-    if (!Array.isArray(entries)) continue;
-    const sitemapPrefix = route.servedUrl.slice(0, -4);
-    for (const entry of entries) {
-      if (!isObject(entry) || Reflect.get(entry, "id") == null) {
-        throw new Error("id property is required for every item returned from generateSitemaps");
+    if (isImageMetadataRoute(route) && functions.generateImageMetadata) {
+      const entries = await functions.generateImageMetadata({});
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        if (!isObject(entry) || Reflect.get(entry, "id") == null) {
+          throw new Error(
+            "id property is required for every item returned from generateImageMetadata",
+          );
+        }
+        const id = String(Reflect.get(entry, "id"));
+        if (!id || !isValidMetadataImageId(id)) continue;
+        paths.push({
+          path: `${route.servedUrl}/${encodeURIComponent(id)}`,
+          routePattern: route.servedUrl,
+          routeSegments: route.routeSegments ?? [],
+        });
       }
-      const id = String(Reflect.get(entry, "id"));
-      if (!id || id.includes("/")) continue;
-      paths.push({
-        path: `${sitemapPrefix}/${encodeURIComponent(id)}.xml`,
-        routePattern: route.servedUrl,
-        routeSegments: route.routeSegments ?? [],
-      });
+      continue;
     }
+
+    paths.push({
+      path: route.servedUrl,
+      routePattern: route.servedUrl,
+      routeSegments: route.routeSegments ?? [],
+    });
   }
 
   return paths;
