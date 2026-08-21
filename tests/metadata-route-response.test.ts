@@ -537,6 +537,112 @@ describe("handleMetadataRouteRequest", () => {
     expect(writes[0].cacheControl.revalidate).toBe(60);
   });
 
+  it("preserves revalidate=false for runtime metadata cache writes", async () => {
+    const writes: IsrWritePolicy[] = [];
+    const response = await handleMetadataRouteRequest({
+      cleanPathname: "/robots.txt",
+      isrRouteKey: (pathname) => pathname,
+      async isrGet() {
+        return null;
+      },
+      async isrSet(_key, _value, policy) {
+        writes.push(policy);
+      },
+      makeThenableParams,
+      metadataRoutes: [
+        {
+          type: "robots",
+          isDynamic: true,
+          filePath: "/tmp/app/robots.ts",
+          routePrefix: "",
+          routeSegments: [],
+          servedUrl: "/robots.txt",
+          contentType: "text/plain",
+          module: {
+            revalidate: false,
+            default: async () => ({ rules: { userAgent: "*" } }),
+          },
+        },
+      ],
+    });
+
+    expect(response?.status).toBe(200);
+    expect(writes).toHaveLength(1);
+    expect(writes[0].cacheControl.revalidate).toBe(false);
+  });
+
+  it("lets internal cacheLife win over exported revalidate=false", async () => {
+    const writes: IsrWritePolicy[] = [];
+    const response = await runWithRequestContext(createRequestContext(), () =>
+      handleMetadataRouteRequest({
+        cleanPathname: "/robots.txt",
+        isrRouteKey: (pathname) => pathname,
+        async isrGet() {
+          return null;
+        },
+        async isrSet(_key, _value, policy) {
+          writes.push(policy);
+        },
+        makeThenableParams,
+        metadataRoutes: [
+          {
+            type: "robots",
+            isDynamic: true,
+            filePath: "/tmp/app/robots.ts",
+            routePrefix: "",
+            routeSegments: [],
+            servedUrl: "/robots.txt",
+            contentType: "text/plain",
+            module: {
+              revalidate: false,
+              default: async () => {
+                _setRequestScopedCacheLife({ revalidate: 60 });
+                return { rules: { userAgent: "*" } };
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(writes).toHaveLength(1);
+    expect(writes[0].cacheControl.revalidate).toBe(60);
+  });
+
+  it("falls back to the default cache life when no revalidate is exported", async () => {
+    const writes: IsrWritePolicy[] = [];
+    const response = await handleMetadataRouteRequest({
+      cleanPathname: "/robots.txt",
+      isrRouteKey: (pathname) => pathname,
+      async isrGet() {
+        return null;
+      },
+      async isrSet(_key, _value, policy) {
+        writes.push(policy);
+      },
+      makeThenableParams,
+      metadataRoutes: [
+        {
+          type: "robots",
+          isDynamic: true,
+          filePath: "/tmp/app/robots.ts",
+          routePrefix: "",
+          routeSegments: [],
+          servedUrl: "/robots.txt",
+          contentType: "text/plain",
+          module: {
+            default: async () => ({ rules: { userAgent: "*" } }),
+          },
+        },
+      ],
+    });
+
+    expect(response?.status).toBe(200);
+    expect(writes).toHaveLength(1);
+    expect(writes[0].cacheControl.revalidate).toBe(900);
+  });
+
   it("applies cache life declared inside metadata route default export to runtime cache write policy", async () => {
     const writes: IsrWritePolicy[] = [];
     const response = await runWithRequestContext(createRequestContext(), () =>

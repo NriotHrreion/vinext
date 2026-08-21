@@ -219,6 +219,11 @@ function applyMetadataRouteRevalidate(route: MetadataRuntimeRoute): void {
   const module = route.module ?? {};
   const revalidate = Reflect.get(module, "revalidate");
 
+  if (revalidate === false) {
+    _setRequestScopedCacheLife({ revalidate: Infinity });
+    return;
+  }
+
   if (typeof revalidate === "number" && Number.isFinite(revalidate) && revalidate > 0) {
     _setRequestScopedCacheLife({ revalidate });
   }
@@ -369,11 +374,12 @@ async function writeRenderedMetadataRoute(
   }
   const previousCacheControl = previousEntry?.value.cacheControl;
   const defaultCacheLife = cacheLifeProfiles.default;
-  const revalidate =
+  const resolvedRevalidate =
     rendered.cacheLife?.revalidate ??
     previousCacheControl?.revalidate ??
     defaultCacheLife.revalidate ??
     900;
+  const revalidate = resolvedRevalidate === Infinity ? false : resolvedRevalidate;
   const expire =
     rendered.cacheLife?.expire ?? previousCacheControl?.expire ?? defaultCacheLife.expire;
   const stale = resolveClientStaleTimeSeconds(rendered.cacheLife) ?? previousCacheControl?.stale;
