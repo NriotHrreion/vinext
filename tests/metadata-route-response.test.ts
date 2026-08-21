@@ -446,6 +446,9 @@ describe("handleMetadataRouteRequest", () => {
     );
 
     expect(response?.headers.get("x-next-cache-tags")).toBe("metadata-user-tag");
+    expect(response?.headers.get("x-vinext-prerender-cache-life")).toBe(
+      '{"revalidate":60,"expire":300,"stale":30}',
+    );
   });
 
   it("still enumerates metadata routes with a positive revalidate for prerendering", async () => {
@@ -532,6 +535,48 @@ describe("handleMetadataRouteRequest", () => {
     expect(response?.status).toBe(200);
     expect(writes).toHaveLength(1);
     expect(writes[0].cacheControl.revalidate).toBe(60);
+  });
+
+  it("applies cache life declared inside metadata route default export to runtime cache write policy", async () => {
+    const writes: IsrWritePolicy[] = [];
+    const response = await runWithRequestContext(createRequestContext(), () =>
+      handleMetadataRouteRequest({
+        cleanPathname: "/robots.txt",
+        isrRouteKey: (pathname) => pathname,
+        async isrGet() {
+          return null;
+        },
+        async isrSet(_key, _value, policy) {
+          writes.push(policy);
+        },
+        makeThenableParams,
+        metadataRoutes: [
+          {
+            type: "robots",
+            isDynamic: true,
+            filePath: "/tmp/app/robots.ts",
+            routePrefix: "",
+            routeSegments: [],
+            servedUrl: "/robots.txt",
+            contentType: "text/plain",
+            module: {
+              default: async () => {
+                _setRequestScopedCacheLife({ revalidate: 60, expire: 300, stale: 30 });
+                return { rules: { userAgent: "*" } };
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(writes).toHaveLength(1);
+    expect(writes[0].cacheControl).toEqual({
+      revalidate: 60,
+      expire: 300,
+      stale: 30,
+    });
   });
 
   it("does not replay an unrelated cached App Route response as metadata", async () => {
@@ -1137,6 +1182,98 @@ describe("handleMetadataRouteRequest", () => {
     expect(receivedPrimitiveId).toBe("0");
     expect(response?.headers.get("cache-control")).toBe("public, max-age=0, must-revalidate");
     expect(await response?.text()).toContain("https://example.com/products/0");
+  });
+
+  it("captures cache life declared inside a generated sitemap default export for runtime ISR", async () => {
+    const writes: IsrWritePolicy[] = [];
+    const route = {
+      type: "sitemap",
+      isDynamic: true,
+      filePath: "/tmp/app/products/sitemap.ts",
+      routePrefix: "/products",
+      routeSegments: ["products"],
+      servedUrl: "/products/sitemap.xml",
+      contentType: "application/xml",
+      module: {
+        generateSitemaps: () => [{ id: 0 }],
+        default: async ({
+          id,
+        }: {
+          id: Promise<string | undefined> & {
+            toString(): string;
+            [Symbol.toPrimitive](): string;
+          };
+        }) => {
+          _setRequestScopedCacheLife({ revalidate: 60, expire: 300, stale: 30 });
+          return [{ url: `https://example.com/products/${await id}` }];
+        },
+      },
+    } satisfies MetadataFileRoute;
+
+    const response = await runWithRequestContext(createRequestContext(), () =>
+      handleMetadataRouteRequest({
+        metadataRoutes: [route],
+        cleanPathname: "/products/sitemap/0.xml",
+        isrRouteKey: (pathname) => pathname,
+        async isrGet() {
+          return null;
+        },
+        async isrSet(_key, _value, policy) {
+          writes.push(policy);
+        },
+        makeThenableParams,
+      }),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(await response?.text()).toContain("https://example.com/products/0");
+    expect(writes).toHaveLength(1);
+    expect(writes[0].cacheControl).toEqual({
+      revalidate: 60,
+      expire: 300,
+      stale: 30,
+    });
+  });
+
+  it("captures cache life declared inside a generated sitemap default export for prerender seeding", async () => {
+    const response = await withEnvVar("VINEXT_PRERENDER", "1", () =>
+      runWithRequestContext(createRequestContext(), () =>
+        handleMetadataRouteRequest({
+          cleanPathname: "/products/sitemap/0.xml",
+          makeThenableParams,
+          metadataRoutes: [
+            {
+              type: "sitemap",
+              isDynamic: true,
+              filePath: "/tmp/app/products/sitemap.ts",
+              routePrefix: "/products",
+              routeSegments: ["products"],
+              servedUrl: "/products/sitemap.xml",
+              contentType: "application/xml",
+              module: {
+                generateSitemaps: () => [{ id: 0 }],
+                default: async ({
+                  id,
+                }: {
+                  id: Promise<string | undefined> & {
+                    toString(): string;
+                    [Symbol.toPrimitive](): string;
+                  };
+                }) => {
+                  _setRequestScopedCacheLife({ revalidate: 60, expire: 300, stale: 30 });
+                  return [{ url: `https://example.com/products/${await id}` }];
+                },
+              },
+            },
+          ],
+        }),
+      ),
+    );
+
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get("x-vinext-prerender-cache-life")).toBe(
+      '{"revalidate":60,"expire":300,"stale":30}',
+    );
   });
 
   it("throws when matched static metadata route data is missing", async () => {
