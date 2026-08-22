@@ -4,6 +4,7 @@ import {
   generateAppRouterViteConfig,
   generatePagesRouterViteConfig,
   getWranglerImagesBinding,
+  updateViteConfigForCssModules,
   updateViteConfigForCloudflare,
   updateWranglerConfigForCloudflare,
 } from "../packages/vinext/src/init-cloudflare.js";
@@ -17,6 +18,214 @@ function expectValidConfig(output: string): void {
   });
   expect(parsed.errors.filter((diagnostic) => diagnostic.severity === "Error")).toEqual([]);
 }
+
+describe("updateViteConfigForCssModules", () => {
+  it("generates the workaround for both Cloudflare router configs", () => {
+    for (const config of [
+      generateAppRouterViteConfig(undefined, undefined, "IMAGES", false, true),
+      generatePagesRouterViteConfig(undefined, undefined, "IMAGES", false, true),
+    ]) {
+      expectValidConfig(config);
+      expect(config.indexOf("patchCssModules()")).toBeLessThan(config.indexOf("vinext("));
+      expect(config).toContain("generateScopedName(name, filename)");
+      expect(config.match(/from "node:path"/g)).toHaveLength(1);
+    }
+  });
+
+  it("incrementally adds the plugin first and preserves existing CSS options", () => {
+    const input = `import vinext from "vinext";
+export default {
+  plugins: [vinext()],
+  css: { modules: { localsConvention: "camelCase" } },
+  server: { port: 4321 },
+};
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain('import { patchCssModules } from "vite-css-modules"');
+    expect(result.code.indexOf("patchCssModules()")).toBeLessThan(result.code.indexOf("vinext()"));
+    expect(result.code).toContain('localsConvention: "camelCase"');
+    expect(result.code).toContain("server: { port: 4321 }");
+    expect(result.code).toContain("generateScopedName(name, filename)");
+    expect(result.preservedExistingGenerateScopedName).toBe(false);
+  });
+
+  it("supports CommonJS configs and is idempotent", () => {
+    const input = `const vinext = require("vinext");
+module.exports = { plugins: [vinext()] };
+`;
+
+    const first = updateViteConfigForCssModules("vite.config.cjs", input);
+    const second = updateViteConfigForCssModules("vite.config.cjs", first.code);
+
+    expect(first.code).toContain('require("vite-css-modules")');
+    expect(first.code).toContain('require("node:crypto")');
+    expect(first.code).toContain('require("node:path")');
+    expect(first.code).toContain(".relative(__dirname,");
+    expect(second.code).toBe(first.code);
+    expect(second.changed).toBe(false);
+  });
+
+  it("recognizes an existing namespace plugin call", () => {
+    const input = `import * as cssModules from "vite-css-modules";
+export default { plugins: [cssModules.patchCssModules({ generateSourceTypes: true })] };
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expect(result.code.match(/patchCssModules/g)).toHaveLength(1);
+    expect(result.code).not.toContain("import { patchCssModules }");
+    expect(result.code).toContain("generateScopedName(name, filename)");
+  });
+
+  it("preserves an existing generateScopedName", () => {
+    const input = `export default {
+  plugins: [],
+  css: { modules: { generateScopedName: "custom_[hash]" } },
+};
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expect(result.code).toContain('generateScopedName: "custom_[hash]"');
+    expect(result.code).not.toContain("generateScopedName(name, filename)");
+    expect(result.preservedExistingGenerateScopedName).toBe(true);
+  });
+
+  it("keeps the comma after an existing multiline css property", () => {
+    const input = `import { defineConfig } from "vite";
+export default defineConfig({
+  css: {
+    modules: {
+      generateScopedName: "test"
+    }
+  }
+});
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain('    generateScopedName: "test"');
+    expect(result.code).toContain("  },\n  plugins: [patchCssModules()],");
+    expect(result.code).not.toContain("\n,\n");
+    expect(result.preservedExistingGenerateScopedName).toBe(true);
+  });
+
+  it.each([
+    ["no trivia", "vite.config.ts", "export default defineConfig({});\n"],
+    ["inline whitespace", "vite.config.ts", "export default defineConfig({   });\n"],
+    ["multiline whitespace", "vite.config.ts", "export default defineConfig({\n    \n\t\n});\n"],
+    ["CRLF whitespace", "vite.config.ts", "export default defineConfig({\r\n  \r\n});\r\n"],
+    ["a plain ESM object", "vite.config.mjs", "export default {\n  \n};\n"],
+    ["a CommonJS object", "vite.config.cjs", "module.exports = {\n  \n};\n"],
+  ])("normalizes an otherwise empty config with $0", (_name, filePath, input) => {
+    const result = updateViteConfigForCssModules(filePath, input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain("{\n  plugins: [patchCssModules()],\n  css: {");
+    expect(result.code).not.toMatch(/\n[\t ]*\n/);
+    expect(updateViteConfigForCssModules(filePath, result.code).code).toBe(result.code);
+  });
+
+  it.each([
+    ["line comment", "export default defineConfig({\n  // keep this comment\n});\n"],
+    ["inline block comment", "export default defineConfig({ /* keep this comment */ });\n"],
+  ])("preserves comments in an otherwise empty config with a $0", (_name, input) => {
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain("keep this comment");
+    expect(result.code).toContain("plugins: [patchCssModules()],");
+    expect(result.code).toContain("css: {");
+  });
+
+  it("normalizes whitespace-only plugins, css, and modules containers", () => {
+    const inputs = [
+      "export default defineConfig({\n  plugins: [\n    \n  ]\n});\n",
+      "export default defineConfig({\n  css: {\n    \n  }\n});\n",
+      "export default defineConfig({\n  css: {\n    modules: {\n      \n    }\n  }\n});\n",
+    ];
+
+    for (const input of inputs) {
+      const result = updateViteConfigForCssModules("vite.config.ts", input);
+      expectValidConfig(result.code);
+      expect(result.code).toContain("plugins: [patchCssModules()]");
+      expect(result.code).toContain("modules: {\n      generateScopedName(name, filename)");
+      expect(result.code).not.toMatch(/\n[\t ]*\n/);
+    }
+  });
+
+  it("preserves comments in an otherwise empty plugins array", () => {
+    const input = `export default defineConfig({
+  plugins: [
+    // keep plugin comment
+  ]
+});
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain("// keep plugin comment\n    patchCssModules()");
+  });
+
+  it.each([
+    [
+      "css object",
+      `export default defineConfig({
+  css: {
+    // keep nested comment
+  }
+});
+`,
+    ],
+    [
+      "modules object",
+      `export default defineConfig({
+  css: {
+    modules: {
+      /* keep nested comment */
+    }
+  }
+});
+`,
+    ],
+  ])("preserves comments in an otherwise empty $0", (_name, input) => {
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain("keep nested comment");
+    expect(result.code).toContain("generateScopedName(name, filename)");
+    expect(result.code).not.toMatch(/\n[\t ]*\n/);
+  });
+
+  it("puts a missing comma before trailing property comments", () => {
+    const input = `export default defineConfig({
+  css: { modules: { generateScopedName: "test" } } // keep css comment
+});
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain(
+      'css: { modules: { generateScopedName: "test" } }, // keep css comment\n  plugins:',
+    );
+    expect(result.preservedExistingGenerateScopedName).toBe(true);
+  });
+
+  it("rejects dynamic CSS Modules config", () => {
+    expect(() =>
+      updateViteConfigForCssModules(
+        "vite.config.ts",
+        "export default { plugins: [], css: { modules: getModules() } };",
+      ),
+    ).toThrow("css.modules option must be a static object");
+  });
+});
 
 describe("updateViteConfigForCloudflare", () => {
   it("updates an existing ESM App Router config without replacing user code", () => {
