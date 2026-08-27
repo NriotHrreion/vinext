@@ -746,13 +746,13 @@ export function generatePagesRouterViteConfig(
 export default defineConfig({
   plugins: [
 ${cssModulesPlugin}    ${vinextExpression(
-      options,
-      "vinext",
-      "imagesOptimizer",
-      imagesBinding,
-      prerender,
-      versionMetadataBinding,
-    ).replace(/\n/g, "\n    ")},
+    options,
+    "vinext",
+    "imagesOptimizer",
+    imagesBinding,
+    prerender,
+    versionMetadataBinding,
+  ).replace(/\n/g, "\n    ")},
     cloudflare(),
   ],${resolveBlock}${cssModulesConfig}
 });
