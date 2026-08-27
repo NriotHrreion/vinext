@@ -892,6 +892,7 @@ export default { plugins: [vinext({ imageOptimization: true })] };
         },
         "IMAGES",
         false,
+        false,
         "CUSTOM_VERSION",
       ),
     ).toContain('cdnAdapter({ versionMetadataBinding: "CUSTOM_VERSION" })');
