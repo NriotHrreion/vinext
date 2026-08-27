@@ -512,6 +512,19 @@ function emitStaticMetadataFiles(
   return outputFiles;
 }
 
+function emitStatic404Files(outDir: string, html: string, trailingSlash: boolean): string[] {
+  const outputFiles = ["404.html"];
+  if (trailingSlash) outputFiles.push("404/index.html");
+
+  for (const outputFile of outputFiles) {
+    const fullPath = path.join(outDir, ...outputFile.split("/"));
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    fs.writeFileSync(fullPath, html, "utf-8");
+  }
+
+  return outputFiles;
+}
+
 /** Map of route patterns to generateStaticParams functions (or null/undefined). */
 export type StaticParamsMap = Record<
   string,
@@ -528,6 +541,7 @@ export type StaticParamsMap = Record<
 export async function resolveParentParams(
   childRoute: AppRoute,
   staticParamsMap: StaticParamsMap,
+  options: { includeLastDynamicSegment?: boolean } = {},
 ): Promise<Record<string, string | string[]>[]> {
   const { patternParts } = childRoute;
 
@@ -549,7 +563,8 @@ export async function resolveParentParams(
   const parentSegments: GenerateStaticParamsFn[] = [];
 
   let prefixPattern = "";
-  for (let i = 0; i < lastDynamicIdx; i++) {
+  const prefixEnd = options.includeLastDynamicSegment ? lastDynamicIdx + 1 : lastDynamicIdx;
+  for (let i = 0; i < prefixEnd; i++) {
     const part = patternParts[i];
     prefixPattern += "/" + part;
     if (!part.startsWith(":")) continue;
@@ -713,7 +728,12 @@ export async function prerenderPages({
     let renderRoundRobin = 0;
     const renderPage = (urlPath: string) => {
       const port = renderPorts[renderRoundRobin++ % renderPorts.length];
-      return fetch(`http://127.0.0.1:${port}${urlPath}`, {
+      // The manual redirect mode below is needed to export redirects returned
+      // by getStaticProps. Avoid confusing the framework's own canonical 308
+      // with one of those application redirects by requesting the configured
+      // trailing-slash form up front, as Next.js's export worker does.
+      const requestPath = config.trailingSlash && !urlPath.endsWith("/") ? `${urlPath}/` : urlPath;
+      return fetch(`http://127.0.0.1:${port}${requestPath}`, {
         headers: secretHeaders,
         redirect: "manual",
       });
@@ -753,7 +773,7 @@ export async function prerenderPages({
                 );
                 return { paths: [], fallback: false };
               }
-              if (text === "null") return { paths: [], fallback: false };
+              if (res.status === 204 || text === "null") return { paths: [], fallback: false };
               return JSON.parse(text) as {
                 paths: Array<StaticPathsEntry>;
                 fallback: unknown;
@@ -974,12 +994,10 @@ export async function prerenderPages({
         const contentType = notFoundRes.headers.get("content-type") ?? "";
         if (notFoundRes.status === 404 && contentType.includes("text/html")) {
           const html404 = await notFoundRes.text();
-          const fullPath = path.join(outDir, "404.html");
-          fs.writeFileSync(fullPath, html404, "utf-8");
           results.push({
             route: "/404",
             status: "rendered",
-            outputFiles: ["404.html"],
+            outputFiles: emitStatic404Files(outDir, html404, config.trailingSlash),
             revalidate: false,
             router: "pages",
           });
@@ -1181,7 +1199,7 @@ export async function prerenderApp({
               );
               return null;
             }
-            if (text === "null") return null;
+            if (res.status === 204 || text === "null") return null;
             return JSON.parse(text) as Record<string, string | string[]>[];
           })();
           // Only cache on success — a rejected or error promise must not poison
@@ -1567,7 +1585,17 @@ export async function prerenderApp({
         if (isSpeculative) {
           htmlHeaders.set(VINEXT_PRERENDER_SPECULATIVE_HEADER, "1");
         }
-        const htmlRequest = new Request(`http://localhost${urlPath}`, { headers: htmlHeaders });
+        // Match Next.js's export worker: when trailingSlash is enabled, render
+        // the canonical slash form instead of letting the request pipeline
+        // return a 308 that the exporter would misclassify as a failed route.
+        // Keep urlPath unchanged for manifest and output-file identity.
+        // Ported from Next.js: packages/next/src/export/worker.ts
+        // https://github.com/vercel/next.js/blob/canary/packages/next/src/export/worker.ts
+        const requestPath =
+          config.trailingSlash && !urlPath.endsWith("/") ? `${urlPath}/` : urlPath;
+        const htmlRequest = new Request(`http://localhost${requestPath}`, {
+          headers: htmlHeaders,
+        });
         const htmlRender = await runWithHeadersContext(
           headersContextFromRequest(htmlRequest),
           async () => {
@@ -1660,7 +1688,7 @@ export async function prerenderApp({
           if (isSpeculative) {
             rscHeaders.set(VINEXT_PRERENDER_SPECULATIVE_HEADER, "1");
           }
-          const rscRequest = new Request(`http://localhost${urlPath}`, {
+          const rscRequest = new Request(`http://localhost${requestPath}`, {
             headers: rscHeaders,
           });
           const rscRes = await runWithHeadersContext(headersContextFromRequest(rscRequest), () =>
@@ -1773,20 +1801,21 @@ export async function prerenderApp({
     // The RSC handler returns 404 with full HTML for the not-found.tsx page (or
     // the default Next.js 404). Write it to 404.html for static deployment.
     try {
-      const notFoundRequest = new Request(`http://localhost${NOT_FOUND_SENTINEL_PATH}`);
+      const notFoundPath =
+        config.trailingSlash && !NOT_FOUND_SENTINEL_PATH.endsWith("/")
+          ? `${NOT_FOUND_SENTINEL_PATH}/`
+          : NOT_FOUND_SENTINEL_PATH;
+      const notFoundRequest = new Request(`http://localhost${notFoundPath}`);
       const notFoundRes = await runWithHeadersContext(
         headersContextFromRequest(notFoundRequest),
         () => rscHandler(notFoundRequest),
       );
       if (notFoundRes.status === 404) {
         const html404 = await notFoundRes.text();
-        const fullPath = path.join(outDir, "404.html");
-        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-        fs.writeFileSync(fullPath, html404, "utf-8");
         results.push({
           route: "/404",
           status: "rendered",
-          outputFiles: ["404.html"],
+          outputFiles: emitStatic404Files(outDir, html404, config.trailingSlash),
           revalidate: false,
           router: "app",
         });

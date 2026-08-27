@@ -51,6 +51,7 @@ import { generateSsrEntry } from "./entries/app-ssr-entry.js";
 import {
   VIRTUAL_CACHE_ADAPTERS,
   generateCacheAdaptersModule,
+  hasVerbatimResponseVary,
   VINEXT_CACHE_CONFIG_PLUGIN_PROPERTY,
   type VinextCacheConfig,
 } from "./cache/cache-adapters-virtual.js";
@@ -1503,6 +1504,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   // once while generating the RSC entry.
   let devPublicFileRoutes: Set<string> | null = null;
   let publicDirConflictOptions: Parameters<typeof assertNoPublicDirAssetConflict>[0] | null = null;
+  let rscBuildIdentity: string | undefined;
   let rscCompatibilityId: string | undefined;
   let draftModeSecret = getPagesPreviewModeId();
   let previewBuildCredentials: PreviewBuildCredentials | undefined;
@@ -2306,6 +2308,13 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               ? sharedRscCompatibilityId
               : createRscCompatibilityId(nextConfig);
         }
+        if (env?.command === "build" && rscBuildIdentity === undefined) {
+          const sharedRscBuildIdentity = process.env.__VINEXT_SHARED_RSC_BUILD_IDENTITY;
+          rscBuildIdentity =
+            sharedRscBuildIdentity && sharedRscBuildIdentity.length > 0
+              ? sharedRscBuildIdentity
+              : randomBytes(16).toString("hex");
+        }
         fileMatcher = createValidFileMatcher(nextConfig.pageExtensions);
         globalNotFoundCssIsolationPath =
           env?.command === "build" && nextConfig.globalNotFound
@@ -2460,11 +2469,18 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // Also used to namespace ISR cache keys so old cached entries from a
         // previous deploy are never served by the new one.
         defines["process.env.__VINEXT_BUILD_ID"] = JSON.stringify(nextConfig.buildId);
+        // Strict-Vary shared caches can use one stable public URL for the
+        // definitive RSC and loading-shell representations. Other adapters
+        // retain Next-compatible contextual `_rsc` digests.
+        defines["process.env.__VINEXT_CANONICAL_RSC_REQUESTS"] = JSON.stringify(
+          env?.command === "build" && hasVerbatimResponseVary(options.cache) ? "1" : "",
+        );
         // Public browser-facing identity for App Router RSC compatibility
         // checks. Prefer Next.js-style deploymentId when configured; otherwise
         // generate a separate token so RSC headers do not expose
         // generateBuildId() verbatim.
         defines["process.env.__VINEXT_RSC_COMPATIBILITY_ID"] = JSON.stringify(rscCompatibilityId);
+        defines["process.env.__VINEXT_RSC_BUILD_IDENTITY"] = JSON.stringify(rscBuildIdentity ?? "");
         // Deployment ID — mirrors Next.js' configured NEXT_DEPLOYMENT_ID.
         // This remains empty when deploymentId is not configured; the separate
         // "use cache" key builder falls back to __VINEXT_BUILD_ID when needed.
@@ -4111,6 +4127,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               graph.routeManifest,
               pagesPrefetchRoutes,
               nextConfig.rewrites,
+              nextConfig.i18n?.locales,
             );
           }
           if (id === RESOLVED_APP_CAPABILITIES && hasAppDir) {
@@ -6657,6 +6674,9 @@ export const loadServerActionClient = ${
             const outDir = path.join(root, "dist", "server");
             fs.mkdirSync(outDir, { recursive: true });
             fs.writeFileSync(path.join(outDir, "BUILD_ID"), nextConfig!.buildId);
+            if (rscBuildIdentity) {
+              fs.writeFileSync(path.join(outDir, "RSC_BUILD_ID"), rscBuildIdentity);
+            }
           },
         },
       };

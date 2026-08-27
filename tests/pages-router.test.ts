@@ -4665,6 +4665,8 @@ describe("Plugin config", () => {
   it("injects an opaque App Router RSC compatibility ID instead of the raw build ID", async () => {
     const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-rsc-compat-id-"));
     const buildId = "release-2026-05-15";
+    const previousSharedRscBuildIdentity = process.env.__VINEXT_SHARED_RSC_BUILD_IDENTITY;
+    delete process.env.__VINEXT_SHARED_RSC_BUILD_IDENTITY;
 
     await fsp.mkdir(path.join(tmpDir, "pages"), { recursive: true });
     await fsp.writeFile(
@@ -4700,7 +4702,30 @@ describe("Plugin config", () => {
       expect(repeatedResult.define["process.env.__VINEXT_RSC_COMPATIBILITY_ID"]).toBe(
         result.define["process.env.__VINEXT_RSC_COMPATIBILITY_ID"],
       );
+      const rscBuildIdentity = result.define["process.env.__VINEXT_RSC_BUILD_IDENTITY"];
+      expect(JSON.parse(rscBuildIdentity)).toMatch(/^[0-9a-f]{32}$/);
+      expect(repeatedResult.define["process.env.__VINEXT_RSC_BUILD_IDENTITY"]).toBe(
+        rscBuildIdentity,
+      );
+
+      const nextBuildPlugins = vinext({
+        nextConfig: { generateBuildId: () => buildId },
+      }) as any[];
+      const nextBuildConfigPlugin = nextBuildPlugins.find((p) => p.name === "vinext:config");
+      const nextBuildResult = await nextBuildConfigPlugin.config(
+        { root: tmpDir, plugins: [] },
+        { command: "build", mode: "production" },
+      );
+      expect(nextBuildResult.define["process.env.__VINEXT_BUILD_ID"]).toBe(JSON.stringify(buildId));
+      expect(nextBuildResult.define["process.env.__VINEXT_RSC_BUILD_IDENTITY"]).not.toBe(
+        rscBuildIdentity,
+      );
     } finally {
+      if (previousSharedRscBuildIdentity === undefined) {
+        delete process.env.__VINEXT_SHARED_RSC_BUILD_IDENTITY;
+      } else {
+        process.env.__VINEXT_SHARED_RSC_BUILD_IDENTITY = previousSharedRscBuildIdentity;
+      }
       await fsp.rm(tmpDir, { recursive: true, force: true });
     }
   });
@@ -8982,20 +9007,23 @@ describe("Static export (Pages Router)", () => {
     const { staticExportPages } = await import("../packages/vinext/src/build/static-export.js");
     const { pagesRouter, apiRouter } =
       await import("../packages/vinext/src/routing/pages-router.js");
-    const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+    const { loadNextConfig, resolveNextConfig } =
+      await import("../packages/vinext/src/config/next-config.js");
 
     const pagesDir = path.resolve(FIXTURE_DIR, "pages");
     const routes = await pagesRouter(pagesDir);
     const apiRoutes = await apiRouter(pagesDir);
-    const config = await resolveNextConfig({
-      output: "export",
+    const trailingConfig = {
+      ...(await loadNextConfig(FIXTURE_DIR)),
       trailingSlash: true,
-    });
+    };
+    const trailingPagesBundlePath = await buildPagesFixture(FIXTURE_DIR, trailingConfig);
+    const config = await resolveNextConfig({ ...trailingConfig, output: "export" });
 
     const trailingDir = path.resolve(FIXTURE_DIR, "out-trailing");
     try {
       const result = await staticExportPages({
-        pagesBundlePath,
+        pagesBundlePath: trailingPagesBundlePath,
         routes,
         apiRoutes,
         pagesDir,
@@ -9006,6 +9034,14 @@ describe("Static export (Pages Router)", () => {
       // With trailingSlash, about → about/index.html
       expect(result.files).toContain("about/index.html");
       expect(fs.existsSync(path.join(trailingDir, "about", "index.html"))).toBe(true);
+
+      // Ported from Next.js: test/production/export-404/export-404.test.ts
+      // https://github.com/vercel/next.js/blob/canary/test/production/export-404/export-404.test.ts
+      expect(result.files).toContain("404.html");
+      expect(result.files).toContain("404/index.html");
+      expect(fs.readFileSync(path.join(trailingDir, "404.html"), "utf-8")).toBe(
+        fs.readFileSync(path.join(trailingDir, "404", "index.html"), "utf-8"),
+      );
     } finally {
       fs.rmSync(trailingDir, { recursive: true, force: true });
     }
