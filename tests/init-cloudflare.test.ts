@@ -21,13 +21,17 @@ function expectValidConfig(output: string): void {
 }
 
 describe("updateViteConfigForCssModules", () => {
-  it("generates the workaround for both Cloudflare router configs", () => {
+  // Regression for https://github.com/cloudflare/vinext/issues/2992#issuecomment-5348417497
+  it("uses Next-compatible default-only exports for both Cloudflare router configs", () => {
     for (const config of [
       generateAppRouterViteConfig(undefined, undefined, "IMAGES", false, true),
       generatePagesRouterViteConfig(undefined, undefined, "IMAGES", false, true),
     ]) {
       expectValidConfig(config);
-      expect(config.indexOf("patchCssModules()")).toBeLessThan(config.indexOf("vinext("));
+      const patchCall = 'patchCssModules({ exportMode: "default" })';
+      expect(config).toContain(patchCall);
+      expect(config.indexOf(patchCall)).toBeLessThan(config.indexOf("vinext("));
+      expect(config).not.toContain("patchCssModules()");
       expect(config).toContain("generateScopedName(name, filename)");
       expect(config.match(/from "node:path"/g)).toHaveLength(1);
     }
@@ -46,7 +50,10 @@ export default {
 
     expectValidConfig(result.code);
     expect(result.code).toContain('import { patchCssModules } from "vite-css-modules"');
-    expect(result.code.indexOf("patchCssModules()")).toBeLessThan(result.code.indexOf("vinext()"));
+    const patchCall = 'patchCssModules({ exportMode: "default" })';
+    expect(result.code).toContain(patchCall);
+    expect(result.code.indexOf(patchCall)).toBeLessThan(result.code.indexOf("vinext()"));
+    expect(result.code).not.toContain("patchCssModules()");
     expect(result.code).toContain('localsConvention: "camelCase"');
     expect(result.code).toContain("server: { port: 4321 }");
     expect(result.code).toContain("generateScopedName(name, filename)");
@@ -64,6 +71,8 @@ module.exports = { plugins: [vinext()] };
     expect(first.code).toContain('require("vite-css-modules")');
     expect(first.code).toContain('require("node:crypto")');
     expect(first.code).toContain('require("node:path")');
+    expect(first.code).toContain('patchCssModules({ exportMode: "default" })');
+    expect(first.code).not.toContain("patchCssModules()");
     expect(first.code).toContain(".relative(__dirname,");
     expect(second.code).toBe(first.code);
     expect(second.changed).toBe(false);
@@ -78,6 +87,8 @@ export default { plugins: [cssModules.patchCssModules({ generateSourceTypes: tru
 
     expect(result.code.match(/patchCssModules/g)).toHaveLength(1);
     expect(result.code).not.toContain("import { patchCssModules }");
+    expect(result.code).toContain("cssModules.patchCssModules({ generateSourceTypes: true })");
+    expect(result.code).not.toContain('exportMode: "default"');
     expect(result.code).toContain("generateScopedName(name, filename)");
   });
 
@@ -110,7 +121,7 @@ export default defineConfig({
 
     expectValidConfig(result.code);
     expect(result.code).toContain('    generateScopedName: "test"');
-    expect(result.code).toContain("  },\n  plugins: [patchCssModules()],");
+    expect(result.code).toContain('  },\n  plugins: [patchCssModules({ exportMode: "default" })],');
     expect(result.code).not.toContain("\n,\n");
     expect(result.preservedExistingGenerateScopedName).toBe(true);
   });
@@ -126,7 +137,9 @@ export default defineConfig({
     const result = updateViteConfigForCssModules(filePath, input);
 
     expectValidConfig(result.code);
-    expect(result.code).toContain("{\n  plugins: [patchCssModules()],\n  css: {");
+    expect(result.code).toContain(
+      '{\n  plugins: [patchCssModules({ exportMode: "default" })],\n  css: {',
+    );
     expect(result.code).not.toMatch(/\n[\t ]*\n/);
     expect(updateViteConfigForCssModules(filePath, result.code).code).toBe(result.code);
   });
@@ -139,7 +152,7 @@ export default defineConfig({
 
     expectValidConfig(result.code);
     expect(result.code).toContain("keep this comment");
-    expect(result.code).toContain("plugins: [patchCssModules()],");
+    expect(result.code).toContain('plugins: [patchCssModules({ exportMode: "default" })],');
     expect(result.code).toContain("css: {");
   });
 
@@ -153,7 +166,7 @@ export default defineConfig({
     for (const input of inputs) {
       const result = updateViteConfigForCssModules("vite.config.ts", input);
       expectValidConfig(result.code);
-      expect(result.code).toContain("plugins: [patchCssModules()]");
+      expect(result.code).toContain('plugins: [patchCssModules({ exportMode: "default" })]');
       expect(result.code).toContain("modules: {\n      generateScopedName(name, filename)");
       expect(result.code).not.toMatch(/\n[\t ]*\n/);
     }
@@ -170,7 +183,9 @@ export default defineConfig({
     const result = updateViteConfigForCssModules("vite.config.ts", input);
 
     expectValidConfig(result.code);
-    expect(result.code).toContain("// keep plugin comment\n    patchCssModules()");
+    expect(result.code).toContain(
+      '// keep plugin comment\n    patchCssModules({ exportMode: "default" })',
+    );
   });
 
   it.each([

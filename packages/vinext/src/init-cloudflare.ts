@@ -647,7 +647,9 @@ export function generateAppRouterViteConfig(
 
   const plugins: string[] = [];
 
-  if (hasCssModules) plugins.push(`    patchCssModules(),`);
+  if (hasCssModules) {
+    plugins.push(`    patchCssModules({ exportMode: "default" }),`);
+  }
   if (info?.hasMDX) {
     plugins.push(`    // vinext auto-injects @mdx-js/rollup with plugins from next.config`);
   }
@@ -738,7 +740,7 @@ export function generatePagesRouterViteConfig(
     resolveBlock = `\n  resolve: {\n    alias: {\n${aliases.join("\n")}\n    },\n  },`;
   }
 
-  const cssModulesPlugin = hasCssModules ? "    patchCssModules(),\n" : "";
+  const cssModulesPlugin = hasCssModules ? '    patchCssModules({ exportMode: "default" }),\n' : "";
   const cssModulesConfig = hasCssModules ? cssModulesConfigSource("  ", "path", "createHash") : "";
 
   return `${imports.join("\n")}
@@ -1786,7 +1788,13 @@ export function updateViteConfigForCssModules(
           "patchCssModules",
           patchLocal,
         );
-    ensurePluginFirst(firstOutput, firstConfig, `${patchBinding}()`, patchBinding, code);
+    ensurePluginFirst(
+      firstOutput,
+      firstConfig,
+      `${patchBinding}({ exportMode: "default" })`,
+      patchBinding,
+      code,
+    );
   }
 
   const withPlugin = firstOutput.toString();

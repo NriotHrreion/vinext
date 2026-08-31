@@ -261,10 +261,13 @@ describe("generateViteConfig", () => {
     expect(config).toContain('vinext({ prerender: { routes: "*" } })');
   });
 
-  it("adds the CSS Modules workaround when requested", () => {
+  it("adds the CSS Modules workaround with Next-compatible default-only exports", () => {
     const config = generateViteConfig(false, false, true);
     expect(config).toContain('from "vite-css-modules"');
-    expect(config.indexOf("patchCssModules()")).toBeLessThan(config.indexOf("vinext()"));
+    const patchCall = 'patchCssModules({ exportMode: "default" })';
+    expect(config).toContain(patchCall);
+    expect(config.indexOf(patchCall)).toBeLessThan(config.indexOf("vinext()"));
+    expect(config).not.toContain("patchCssModules()");
     expect(config).toContain("generateScopedName(name, filename)");
     expect(config).toContain("import.meta.dirname");
     expect(config).toContain(".slice(0, 7)");
@@ -1217,7 +1220,10 @@ describe("init — dependency installation", () => {
     expect(result.installedDeps).toContain("vite-css-modules");
     expect(execCalls.some(({ cmd }) => cmd.includes("vite-css-modules"))).toBe(true);
     const config = readFile(tmpDir, "vite.config.ts");
-    expect(config.indexOf("patchCssModules()")).toBeLessThan(config.indexOf("vinext()"));
+    const patchCall = 'patchCssModules({ exportMode: "default" })';
+    expect(config).toContain(patchCall);
+    expect(config.indexOf(patchCall)).toBeLessThan(config.indexOf("vinext()"));
+    expect(config).not.toContain("patchCssModules()");
     expect(config).toContain("generateScopedName(name, filename)");
     expect(output).toContain("Configured vite-css-modules for CSS Modules");
   });
@@ -1499,7 +1505,8 @@ describe("init — guard rails", () => {
 
     const config = readFile(tmpDir, "vite.config.ts");
     expect(config).toContain('generateScopedName: "custom_[hash]"');
-    expect(config).toContain("patchCssModules()");
+    expect(config).toContain('patchCssModules({ exportMode: "default" })');
+    expect(config).not.toContain("patchCssModules()");
     expect(output).toContain("Preserved existing css.modules.generateScopedName");
   });
 
