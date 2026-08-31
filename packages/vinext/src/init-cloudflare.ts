@@ -806,6 +806,25 @@ function findProperty(object: AstObject, name: string): AstProperty | undefined 
   );
 }
 
+function findLastProperty(object: AstObject, name: string): AstProperty | undefined {
+  for (let index = object.properties.length - 1; index >= 0; index--) {
+    const property = object.properties[index];
+    if (property.type === "Property" && propertyName(property) === name) return property;
+  }
+  return undefined;
+}
+
+/**
+ * A missing property may be supplied by any spread, while an existing property
+ * may be overridden by a later spread because object composition is last-write-wins.
+ */
+function hasPotentialSpreadOverride(object: AstObject, property: AstProperty | undefined): boolean {
+  const propertyIndex = property ? object.properties.lastIndexOf(property) : -1;
+  return object.properties
+    .slice(propertyIndex + 1)
+    .some((candidate) => candidate.type === "SpreadElement");
+}
+
 function unwrapObject(expression: ESTree.Expression): AstObject | undefined {
   if (expression.type === "ObjectExpression") return expression as AstObject;
   if (expression.type === "ParenthesizedExpression") return unwrapObject(expression.expression);
@@ -1684,7 +1703,12 @@ function ensureCssModulesScopedName(
   createHashBinding: string,
   rootExpression: string,
 ): boolean {
-  const css = findProperty(config, "css");
+  const css = findLastProperty(config, "css");
+  if (hasPotentialSpreadOverride(config, css)) {
+    throw new Error(
+      "The Vite config's css option must be explicitly defined after any spread properties so vinext init can configure CSS Modules without replacing existing options.",
+    );
+  }
   if (!css) {
     const indent = objectPropertyIndent(config, code);
     insertObjectProperty(
@@ -1707,7 +1731,12 @@ function ensureCssModulesScopedName(
     );
   }
   const cssObject = css.value as AstObject;
-  const modules = findProperty(cssObject, "modules");
+  const modules = findLastProperty(cssObject, "modules");
+  if (hasPotentialSpreadOverride(cssObject, modules)) {
+    throw new Error(
+      "The Vite config's css.modules option must be explicitly defined after any spread properties so vinext init can configure CSS Modules without replacing existing options.",
+    );
+  }
   if (!modules) {
     const indent = objectPropertyIndent(cssObject, code);
     insertObjectProperty(
@@ -1730,7 +1759,15 @@ function ensureCssModulesScopedName(
     );
   }
   const modulesObject = modules.value as AstObject;
-  if (findProperty(modulesObject, "generateScopedName")) return true;
+  const generateScopedName = findLastProperty(modulesObject, "generateScopedName");
+  if (generateScopedName) {
+    if (hasPotentialSpreadOverride(modulesObject, generateScopedName)) {
+      throw new Error(
+        "The Vite config's css.modules.generateScopedName option must appear after any spread properties so vinext init can verify it.",
+      );
+    }
+    return true;
+  }
   const indent = objectPropertyIndent(modulesObject, code);
   insertObjectProperty(
     output,

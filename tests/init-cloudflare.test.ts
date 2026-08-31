@@ -241,6 +241,69 @@ export default defineConfig({
       ),
     ).toThrow("css.modules option must be a static object");
   });
+
+  it.each([
+    [
+      "CSS is provided only through a root config spread",
+      `const sharedConfig = { css: { modules: { localsConvention: "camelCase" } } };
+export default {
+  plugins: [],
+  ...sharedConfig,
+};
+`,
+    ],
+    [
+      "a later spread can override the direct modules object",
+      `const sharedCss = { modules: { localsConvention: "camelCase" } };
+export default {
+  plugins: [],
+  css: { modules: {}, ...sharedCss },
+};
+`,
+    ],
+    [
+      "modules are provided only through a spread",
+      `const sharedCss = { modules: { localsConvention: "camelCase" } };
+export default {
+  plugins: [],
+  css: { ...sharedCss },
+};
+`,
+    ],
+    [
+      "a later modules spread can override generateScopedName",
+      `const sharedModules = { generateScopedName: "shared_[hash]" };
+export default {
+  plugins: [],
+  css: {
+    modules: { generateScopedName: "custom_[hash]", ...sharedModules },
+  },
+};
+`,
+    ],
+  ])("rejects ambiguous spread-composed CSS config when $0", (_name, input) => {
+    expect(() => updateViteConfigForCssModules("vite.config.ts", input)).toThrow(/spread/i);
+  });
+
+  it("preserves spread-provided module options when explicit modules follow the CSS spread", () => {
+    const input = `const sharedCss = { modules: { localsConvention: "camelCase" } };
+export default {
+  plugins: [],
+  css: {
+    ...sharedCss,
+    modules: { ...sharedCss.modules },
+  },
+};
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain("...sharedCss.modules");
+    expect(result.code.indexOf("...sharedCss.modules")).toBeLessThan(
+      result.code.indexOf("generateScopedName(name, filename)"),
+    );
+  });
 });
 
 describe("updateViteConfigForCloudflare", () => {
