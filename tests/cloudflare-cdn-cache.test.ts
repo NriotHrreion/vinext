@@ -107,6 +107,7 @@ describe("CloudflareCdnCacheAdapter", () => {
     expect(await routedAdapter.validateRequest?.(matching)).toBeNull();
     const response = await routedAdapter.validateRequest?.(mismatching);
     expect(response?.status).toBe(503);
+    expect(response?.headers.get("Content-Type")).toContain("application/json");
     expect(response?.headers.get("Cache-Control")).toBe("no-store");
     await expect(response?.text()).resolves.toContain(
       "Cloudflare invoked Worker version version-b, but vinext warmup expected version-c",
@@ -135,7 +136,8 @@ describe("CloudflareCdnCacheAdapter", () => {
     });
 
     const response = await routedAdapter.validateRequest?.(request);
-    expect(response?.status).toBe(503);
+    expect(response?.status).toBe(500);
+    expect(response?.headers.get("Content-Type")).toContain("application/json");
     await expect(response?.text()).resolves.toContain(
       `received ${VINEXT_EXPECTED_WORKER_VERSION_HEADER} without Cloudflare-Workers-Version-Overrides`,
     );
@@ -154,10 +156,11 @@ describe("CloudflareCdnCacheAdapter", () => {
     });
 
     const response = await routedAdapter.validateRequest?.(request);
-    expect(response?.status).toBe(503);
-    const body = await response?.text();
-    expect(body).toContain("requires the `CUSTOM_VERSION` version metadata binding");
-    expect(body).toContain("Named environments do not inherit this binding");
+    expect(response?.status).toBe(500);
+    expect(response?.headers.get("Content-Type")).toContain("application/json");
+    const body = (await response?.json()) as { error: string };
+    expect(body.error).toContain("requires the `CUSTOM_VERSION` version metadata binding");
+    expect(body.error).toContain("Named environments do not inherit this binding");
   });
 
   it("does not require version metadata for ordinary requests without an override", async () => {
@@ -191,6 +194,14 @@ describe("CloudflareCdnCacheAdapter", () => {
     expect(response.status).toBe(307);
     expect(response.headers.get("location")).toBe("https://example.com/target");
     expect(response.headers.get(VINEXT_CDN_BUILD_ID_HEADER)).toBe("build-a");
+
+    const pagesData = applyCdnResponseIdentityHeaders(
+      Response.json({ pageProps: {} }),
+      new Request("https://example.com/_next/data/build-a/source.json", {
+        headers: { Accept: "application/json" },
+      }),
+    );
+    expect(pagesData.headers.get(VINEXT_CDN_BUILD_ID_HEADER)).toBe("build-a");
   });
 
   it("get returns null so the origin always renders fresh", async () => {
@@ -214,15 +225,17 @@ describe("CloudflareCdnCacheAdapter", () => {
     });
   });
 
-  it("uses max-age (not s-maxage) and public on the edge directive, even pending-dynamic", () => {
+  it("fails closed while an App Page render still has a pending dynamic check", () => {
     const headers = adapter.buildResponseHeaders({
       cacheControl: "s-maxage=60, stale-while-revalidate=540",
       pendingDynamicCheck: true,
     });
-    // Edge caches + SWRs via CDN-Cache-Control; the browser always revalidates.
-    // An already-valued stale-while-revalidate is passed through unchanged.
-    expect(headers["CDN-Cache-Control"]).toBe("public, max-age=60, stale-while-revalidate=540");
-    expect(headers["Cache-Control"]).toBe("public, max-age=0, must-revalidate");
+    expect(headers).toEqual({
+      "Cache-Control": "no-store",
+      "CDN-Cache-Control": null,
+      "Cloudflare-CDN-Cache-Control": null,
+      "Cache-Tag": null,
+    });
   });
 
   it("adds a Cache-Tag header from the page tags", () => {
@@ -320,7 +333,7 @@ describe("CloudflareCdnCacheAdapter", () => {
     expect(response.headers.get("CDN-Cache-Control")).toBeNull();
   });
 
-  it("replaces Cloudflare headers on pending HTML and still skips a late-dynamic cache write", async () => {
+  it("keeps pending HTML private and skips a late-dynamic cache write", async () => {
     setCdnCacheAdapter(new CloudflareCdnCacheAdapter());
     const pendingCacheWrites: Promise<void>[] = [];
     const isrSet = vi.fn();
@@ -359,12 +372,10 @@ describe("CloudflareCdnCacheAdapter", () => {
       },
     );
 
-    expect(response.headers.get("Cache-Control")).toBe("public, max-age=0, must-revalidate");
-    expect(response.headers.get("CDN-Cache-Control")).toBe(
-      "public, max-age=60, stale-while-revalidate=31536000",
-    );
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("CDN-Cache-Control")).toBeNull();
     expect(response.headers.get("Cloudflare-CDN-Cache-Control")).toBeNull();
-    expect(response.headers.get("Cache-Tag")).toBe("/dynamic-html");
+    expect(response.headers.get("Cache-Tag")).toBeNull();
     await expect(response.text()).resolves.toBe("<h1>personalized</h1>");
     await Promise.all(pendingCacheWrites);
     expect(isrSet).not.toHaveBeenCalled();
@@ -495,14 +506,14 @@ describe("CloudflareCdnCacheAdapter", () => {
     await expect(response.text()).resolves.toBe("dynamic-slot-flight");
   });
 
-  it("applies the Cloudflare pending edge policy in a separate adapter case", async () => {
+  it("keeps a pending RSC response out of the Cloudflare edge cache", async () => {
     setCdnCacheAdapter(new CloudflareCdnCacheAdapter());
     const response = finalizePendingDynamicRscResponse();
 
-    expect(response.headers.get("Cache-Control")).toBe("public, max-age=0, must-revalidate");
-    expect(response.headers.get("CDN-Cache-Control")).toBe("public, max-age=60");
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("CDN-Cache-Control")).toBeNull();
     expect(response.headers.get("Cloudflare-CDN-Cache-Control")).toBeNull();
-    expect(response.headers.get("Cache-Tag")).toBe("/dashboard");
+    expect(response.headers.get("Cache-Tag")).toBeNull();
     expect(response.headers.get("X-Vinext-Cache")).toBe("MISS");
     await expect(response.text()).resolves.toBe("pending-dynamic-flight");
   });

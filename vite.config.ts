@@ -50,8 +50,8 @@ export default defineConfig({
     },
     plugins: ["typescript", "unicorn", "import", "react"],
     jsPlugins: [
-      "./oxlint-plugins/prefer-import-alias.js",
-      "./oxlint-plugins/prefer-shared-utils.js",
+      "./oxlint-plugins/prefer-import-alias.ts",
+      "./oxlint-plugins/prefer-shared-utils.ts",
     ],
     rules: {
       "@typescript-eslint/no-explicit-any": "error",

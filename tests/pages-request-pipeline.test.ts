@@ -8,6 +8,11 @@ import {
 } from "../packages/vinext/src/server/pages-request-pipeline.js";
 import { MIDDLEWARE_SKIP_HEADER } from "../packages/vinext/src/server/headers.js";
 import { PRERENDER_REVALIDATE_HEADER } from "../packages/vinext/src/utils/protocol-headers.js";
+import { runWithExecutionContext } from "../packages/vinext/src/shims/request-context.js";
+import {
+  CACHEABILITY_REQUEST_STATE,
+  type RouteCacheabilityState,
+} from "../packages/vinext/src/shims/cacheability-classification.js";
 
 // Helpers
 
@@ -43,6 +48,24 @@ function makeRenderPage(status = 200, body = "ok") {
     async (_req: Request, _url: string, _opts?: PagesRenderOptions) =>
       new Response(body, { status }),
   );
+}
+
+async function cacheabilityReasonFor(
+  request: Request,
+  overrides: Partial<PagesPipelineDeps>,
+): Promise<string | undefined> {
+  const state: RouteCacheabilityState = {
+    captureDeadlineAt: Date.now() + 1_000,
+    mode: "probe",
+  };
+  const context = {
+    [CACHEABILITY_REQUEST_STATE]: state,
+    waitUntil() {},
+  };
+  await runWithExecutionContext(context, () =>
+    runPagesRequest(request, baseDeps({ renderPage: makeRenderPage(), ...overrides })),
+  );
+  return state.forcedDynamicReason;
 }
 
 describe("on-demand revalidation middleware bypass", () => {
@@ -123,6 +146,21 @@ describe("trailing slash normalization", () => {
 
 // 2. Config redirect: permanent redirect → status 308 with Location
 describe("config redirects", () => {
+  it("fails probing closed when an unkeyed redirect condition misses", async () => {
+    expect(
+      await cacheabilityReasonFor(makeRequest("/conditional"), {
+        configRedirects: [
+          {
+            source: "/conditional",
+            destination: "/private",
+            permanent: false,
+            has: [{ type: "cookie", key: "variant", value: "private" }],
+          },
+        ],
+      }),
+    ).toBe("next.config redirect depends on request headers, cookies, or hostnames");
+  });
+
   it("permanent redirect returns 308", async () => {
     const req = makeRequest("/old");
     const result = await runPagesRequest(
@@ -237,6 +275,30 @@ describe("config redirects", () => {
 
 // 4. Middleware redirect short-circuit → {type:"response"} status 307
 describe("middleware", () => {
+  it("fails cacheability closed for a middleware-eligible pathname", async () => {
+    const state: RouteCacheabilityState = {
+      captureDeadlineAt: Date.now() + 1_000,
+      mode: "admit",
+    };
+    const context = {
+      [CACHEABILITY_REQUEST_STATE]: state,
+      waitUntil() {},
+    };
+
+    await runWithExecutionContext(context, () =>
+      runPagesRequest(
+        makeRequest("/conditional"),
+        baseDeps({
+          hasMiddleware: true,
+          renderPage: makeRenderPage(),
+          runMiddleware: makeMiddleware({ continue: true, pathnameEligible: true }),
+        }),
+      ),
+    );
+
+    expect(state.forcedDynamicReason).toBe("middleware can match this pathname");
+  });
+
   it("can present the raw data URL to middleware while routing the normalized page", async () => {
     // Ported from Next.js: packages/next/src/server/next-server.ts
     // (`skipProxyUrlNormalize` selects request meta `initURL` for middleware).
@@ -872,6 +934,34 @@ describe("external proxy", () => {
 
 // 9. beforeFiles rewrite with external URL → {type:"response"} from proxy
 describe("beforeFiles rewrites", () => {
+  it.each(["beforeFiles", "afterFiles", "fallback"] as const)(
+    "fails probing closed when an unkeyed %s rewrite condition misses",
+    async (phase) => {
+      const rewrite = {
+        source: "/conditional",
+        destination: "/private",
+        has: [{ type: "header" as const, key: "x-variant", value: "private" }],
+      };
+      const reason = await cacheabilityReasonFor(makeRequest("/conditional"), {
+        configRewrites: {
+          beforeFiles: phase === "beforeFiles" ? [rewrite] : [],
+          afterFiles: phase === "afterFiles" ? [rewrite] : [],
+          fallback: phase === "fallback" ? [rewrite] : [],
+        },
+        ...(phase === "afterFiles"
+          ? { matchPageRoute: vi.fn().mockReturnValue({ route: { isDynamic: true } }) }
+          : phase === "fallback"
+            ? {
+                matchPageRoute: vi.fn().mockReturnValue(null),
+                renderPage: makeRenderPage(404, "not found"),
+              }
+            : {}),
+      });
+
+      expect(reason).toBe("next.config rewrite depends on request headers, cookies, or hostnames");
+    },
+  );
+
   it("does not match decoded literal aliases from the normalized route pathname", async () => {
     const renderPage = makeRenderPage();
     const result = await runPagesRequest(

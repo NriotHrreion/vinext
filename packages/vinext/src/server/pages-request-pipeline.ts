@@ -43,6 +43,30 @@ import {
   methodNotAllowedResponse,
   sanitizeMethodNotAllowedHeaders,
 } from "./http-error-responses.js";
+import { markRouteCacheabilityDynamic } from "vinext/shims/cacheability-classification";
+
+function ruleUsesUnkeyedRequestCondition(rule: NextRedirect | NextRewrite): boolean {
+  return [...(rule.has ?? []), ...(rule.missing ?? [])].some(
+    (condition) =>
+      condition.type === "header" || condition.type === "cookie" || condition.type === "host",
+  );
+}
+
+function markConditionalRewriteCacheability(rewrite: NextRewrite): void {
+  if (ruleUsesUnkeyedRequestCondition(rewrite)) {
+    markRouteCacheabilityDynamic(
+      "next.config rewrite depends on request headers, cookies, or hostnames",
+    );
+  }
+}
+
+function markConditionalRedirectCacheability(redirect: NextRedirect): void {
+  if (ruleUsesUnkeyedRequestCondition(redirect)) {
+    markRouteCacheabilityDynamic(
+      "next.config redirect depends on request headers, cookies, or hostnames",
+    );
+  }
+}
 
 // All "render options" that are passed through to the renderPage callback
 export type PagesRenderOptions = {
@@ -101,6 +125,8 @@ export async function fetchWorkerFilesystemRoute(
 
 export type MiddlewareResult = {
   continue: boolean;
+  /** The pathname matches middleware, irrespective of request `has`/`missing` conditions. */
+  pathnameEligible?: boolean;
   redirectUrl?: string;
   redirectStatus?: number;
   rewriteUrl?: string;
@@ -344,6 +370,7 @@ export async function runPagesRequest(
       configRedirects,
       reqCtx,
       basePathState,
+      markConditionalRedirectCacheability,
     );
     if (redirect) {
       // Only prepend basePath when the request was actually under basePath.
@@ -412,6 +439,10 @@ export async function runPagesRequest(
     const result = await deps.runMiddleware(deps.middlewareRequest ?? request, deps.ctx ?? null, {
       isDataRequest,
     });
+
+    if (result.pathnameEligible) {
+      markRouteCacheabilityDynamic("middleware can match this pathname");
+    }
 
     // Bubble waitUntil promises
     if (result.waitUntilPromises && result.waitUntilPromises.length > 0) {
@@ -590,6 +621,8 @@ export async function runPagesRequest(
       [rewrite],
       rewriteRequestContext(),
       basePathState,
+      configSourcePathname(),
+      markConditionalRewriteCacheability,
     );
     if (rewritten) {
       if (isExternalUrl(rewritten)) {
@@ -690,6 +723,8 @@ export async function runPagesRequest(
         [rewrite],
         rewriteRequestContext(),
         basePathState,
+        configSourcePathname(),
+        markConditionalRewriteCacheability,
       );
       if (rewritten) {
         if (isExternalUrl(rewritten)) {
@@ -742,6 +777,8 @@ export async function runPagesRequest(
           [rewrite],
           rewriteRequestContext(),
           basePathState,
+          configSourcePathname(),
+          markConditionalRewriteCacheability,
         );
         if (!fallbackRewrite) continue;
         if (isExternalUrl(fallbackRewrite)) {
@@ -801,6 +838,8 @@ export async function runPagesRequest(
           [rewrite],
           rewriteRequestContext(),
           basePathState,
+          configSourcePathname(),
+          markConditionalRewriteCacheability,
         );
         if (!fallbackRewrite) continue;
         if (isExternalUrl(fallbackRewrite)) {
@@ -890,6 +929,8 @@ export async function runPagesRequest(
         [rewrite],
         rewriteRequestContext(),
         basePathState,
+        configSourcePathname(),
+        markConditionalRewriteCacheability,
       );
       if (!fallbackRewrite) continue;
       if (isExternalUrl(fallbackRewrite)) {

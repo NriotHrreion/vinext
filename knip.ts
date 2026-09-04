@@ -31,6 +31,8 @@ export default {
     ".": {
       entry: [
         "scripts/*.{js,ts,mjs,mts}",
+        // Loaded by Oxlint from the string paths in vite.config.ts.
+        "oxlint-plugins/*.ts",
         "tests/**/*.test.ts",
         "tests/helpers.ts",
         // Filesystem route entries in the standalone Vite/Worker fixture.
@@ -41,6 +43,7 @@ export default {
         // Vite's filesystem route/worker discovery rather than static imports.
         "tests/e2e/web-worker/fixtures/**/{vite.config.ts,*.worker.ts}",
         "tests/e2e/nextjs-worker/fixture/**/*.{js,ts,tsx}",
+        "tests/e2e/cacheability-components/fixture/{next.config.ts,vite.config.ts,app/**/{page,route}.{ts,tsx}}",
       ],
       project: ["tests/**/*.{js,ts}", "!tests/fixtures/**"],
       ignoreDependencies: [

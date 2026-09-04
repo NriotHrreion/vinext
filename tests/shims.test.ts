@@ -6577,7 +6577,7 @@ describe("next/cache shim", () => {
             data: {
               headers: {},
               body: JSON.stringify({ v: "stale-value" }),
-              url: "unstable_cache:stale-swr-test:[]",
+              url: "unstable_cache:v2:stale-swr-test:[]",
             },
             tags: ["stale-swr"],
             revalidate: 1,
@@ -6652,7 +6652,7 @@ describe("next/cache shim", () => {
             data: {
               headers: {},
               body: JSON.stringify({ v: "stale-value" }),
-              url: "unstable_cache:foreground-test:[]",
+              url: "unstable_cache:v2:foreground-test:[]",
             },
             tags: ["foreground"],
             revalidate: 1,
@@ -7251,36 +7251,122 @@ describe('"use cache" runtime', () => {
     expect(r3).toEqual({ count: 2 });
   });
 
-  it("private variant marks prerender output dynamic", async () => {
+  it("private variant suspends prerendering before user code", async () => {
     const { registerCachedFunction } =
       await import("../packages/vinext/src/shims/cache-runtime.js");
     const { consumeDynamicUsage } = await import("../packages/vinext/src/shims/headers.js");
     const { createRequestContext, runWithRequestContext } =
       await import("../packages/vinext/src/shims/unified-request-context.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
 
     // Ported from Next.js: "use cache: private" is dynamic in prerendering contexts.
     // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/use-cache/use-cache-wrapper.ts
-    const previousPrerender = process.env.VINEXT_PRERENDER;
-    process.env.VINEXT_PRERENDER = "1";
+    let executions = 0;
+    const cached = registerCachedFunction(
+      async () => {
+        executions++;
+        return "private";
+      },
+      "test:private-prerender",
+      "private",
+    );
+    const controller = new AbortController();
+    let bailoutExpression: string | undefined;
 
-    try {
-      await runWithRequestContext(createRequestContext(), async () => {
-        const cached = registerCachedFunction(
-          async () => "private",
-          "test:private-prerender",
-          "private",
-        );
-        await cached();
+    await runWithRequestContext(createRequestContext(), async () => {
+      const pending = workUnitAsyncStorage.run(
+        {
+          type: "prerender",
+          renderSignal: controller.signal,
+          route: "/private",
+          signalPrerenderBailout(expression) {
+            bailoutExpression = expression;
+          },
+        },
+        () => cached(),
+      );
+      let settled = false;
+      void pending.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      await Promise.resolve();
 
-        expect(consumeDynamicUsage()).toBe(true);
-      });
-    } finally {
-      if (previousPrerender === undefined) {
-        delete process.env.VINEXT_PRERENDER;
-      } else {
-        process.env.VINEXT_PRERENDER = previousPrerender;
-      }
-    }
+      expect(settled).toBe(false);
+      expect(executions).toBe(0);
+      expect(consumeDynamicUsage()).toBe(true);
+      expect(bailoutExpression).toBe('"use cache: private"');
+    });
+  });
+
+  it("bails out of private cache probes before asynchronous setup or user code", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { CACHEABILITY_REQUEST_STATE } =
+      await import("../packages/vinext/src/shims/cacheability-classification.js");
+    const { runWithExecutionContext } =
+      await import("../packages/vinext/src/shims/request-context.js");
+    const { workUnitAsyncStorage } =
+      await import("../packages/vinext/src/shims/internal/work-unit-async-storage.js");
+
+    let executions = 0;
+    const cached = registerCachedFunction(
+      async () => {
+        executions++;
+        return "private";
+      },
+      "test:private-probe",
+      "private",
+    );
+    const state = {
+      captureDeadlineAt: Date.now() + 1_000,
+      mode: "probe" as const,
+      route: { kind: "app-page" as const, pattern: "/private" },
+    };
+
+    const controller = new AbortController();
+    let bailoutExpression: string | undefined;
+    const pending = runWithExecutionContext(
+      {
+        [CACHEABILITY_REQUEST_STATE]: state,
+        waitUntil() {},
+      },
+      () =>
+        workUnitAsyncStorage.run(
+          {
+            type: "prerender",
+            renderSignal: controller.signal,
+            route: "/private",
+            signalPrerenderBailout(expression) {
+              bailoutExpression = expression;
+            },
+          },
+          () => cached(),
+        ),
+    );
+    let settled = false;
+    void pending.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await Promise.resolve();
+
+    expect(settled).toBe(false);
+    expect(executions).toBe(0);
+    expect(state).toMatchObject({
+      outcome: { cacheable: false, dynamicUsage: true },
+      probeBailout: { kind: "private-cache" },
+    });
+    expect(bailoutExpression).toBe('"use cache: private"');
   });
 
   it('rejects "use cache: private" nested inside public "use cache"', async () => {
@@ -13463,6 +13549,20 @@ describe("matchHeaders", () => {
     // Request without the required header should not match
     const matched = matchHeaders("/about", rules, makeCtx());
     expect(matched).toEqual([]);
+  });
+
+  it("reports pathname eligibility before request conditions are evaluated", async () => {
+    const { matchHeaders } = await import("../packages/vinext/src/config/config-matchers.js");
+    const rule: any = {
+      source: "/about",
+      has: [{ type: "cookie", key: "variant", value: "private" }],
+      headers: [{ key: "x-variant", value: "private" }],
+    };
+    const onRulePathnameMatch = vi.fn();
+
+    expect(matchHeaders("/about", [rule], makeCtx(), undefined, onRulePathnameMatch)).toEqual([]);
+    expect(onRulePathnameMatch).toHaveBeenCalledOnce();
+    expect(onRulePathnameMatch).toHaveBeenCalledWith(rule);
   });
 
   // Regression for #1331: under `trailingSlash: true` the incoming pathname

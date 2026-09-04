@@ -1,5 +1,5 @@
 /**
- * Oxlint JS plugin: prefer-import-alias.
+ * Oxlint plugin: prefer-import-alias.
  *
  * Reads `compilerOptions.paths` from the closest enclosing tsconfig.json
  * (following `extends` chains) and reports any relative import whose resolved
@@ -15,15 +15,45 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
+import { definePlugin, defineRule, type Context, type ESTree } from "@oxlint/plugins";
+
 const STRIP_EXT_RE = /\.(?:m?js|c?js|tsx?|jsx)$/;
-const aliasCache = new Map();
+
+type Alias = {
+  keyPrefix: string;
+  keySuffix: string;
+  targetPrefix: string;
+  targetSuffix: string;
+  wildcard: boolean;
+};
+
+type ResolvedTsconfigPaths = {
+  paths: Record<string, unknown>;
+  baseDir: string;
+};
+
+type TsconfigJson = {
+  extends?: unknown;
+  compilerOptions?: {
+    baseUrl?: unknown;
+    paths?: unknown;
+  };
+};
+
+type ImportNode =
+  | ESTree.ImportDeclaration
+  | ESTree.ExportNamedDeclaration
+  | ESTree.ExportAllDeclaration
+  | ESTree.ImportExpression;
+
+const aliasCache = new Map<string, Alias[]>();
 
 /**
  * Strip JSONC line and block comments while respecting string literals.
  * Walks the input character-by-character to avoid eating `//` or `/*` inside
  * strings.
  */
-function stripJsonc(raw) {
+function stripJsonc(raw: string): string {
   let out = "";
   let i = 0;
   const len = raw.length;
@@ -62,7 +92,7 @@ function stripJsonc(raw) {
 }
 
 /** Walk up from `dir` looking for the closest `tsconfig.json`. */
-function findTsconfig(dir) {
+function findTsconfig(dir: string): string | null {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const candidate = path.join(dir, "tsconfig.json");
@@ -77,9 +107,9 @@ function findTsconfig(dir) {
  * Resolve a tsconfig's `extends` reference. Supports relative paths, bare
  * specifiers (resolved via require.resolve), and the implicit `.json` suffix.
  */
-function resolveExtends(extendsValue, fromDir) {
+function resolveExtends(extendsValue: string, fromDir: string): string | null {
   if (typeof extendsValue !== "string") return null;
-  let resolved;
+  let resolved: string;
   if (extendsValue.startsWith(".")) {
     resolved = path.resolve(fromDir, extendsValue);
   } else {
@@ -100,24 +130,35 @@ function resolveExtends(extendsValue, fromDir) {
  * Walk a tsconfig (and its `extends` chain) to find the first one with
  * `compilerOptions.paths` set. Returns `{ paths, baseDir }` or null.
  */
-function loadTsconfigWithExtends(tsconfigPath, visited = new Set()) {
+function loadTsconfigWithExtends(
+  tsconfigPath: string,
+  visited = new Set<string>(),
+): ResolvedTsconfigPaths | null {
   if (visited.has(tsconfigPath)) return null;
   visited.add(tsconfigPath);
-  let cfg;
+  let cfg: TsconfigJson;
   try {
-    cfg = JSON.parse(stripJsonc(fs.readFileSync(tsconfigPath, "utf-8")));
+    cfg = JSON.parse(stripJsonc(fs.readFileSync(tsconfigPath, "utf-8"))) as TsconfigJson;
   } catch {
     return null;
   }
   const dir = path.dirname(tsconfigPath);
   const compilerOptions = cfg?.compilerOptions ?? {};
-  if (compilerOptions.paths) {
-    const baseDir = compilerOptions.baseUrl ? path.resolve(dir, compilerOptions.baseUrl) : dir;
-    return { paths: compilerOptions.paths, baseDir };
+  if (
+    compilerOptions.paths !== null &&
+    typeof compilerOptions.paths === "object" &&
+    !Array.isArray(compilerOptions.paths)
+  ) {
+    const baseDir =
+      typeof compilerOptions.baseUrl === "string"
+        ? path.resolve(dir, compilerOptions.baseUrl)
+        : dir;
+    return { paths: compilerOptions.paths as Record<string, unknown>, baseDir };
   }
   if (cfg.extends) {
-    const list = Array.isArray(cfg.extends) ? cfg.extends : [cfg.extends];
+    const list: unknown[] = Array.isArray(cfg.extends) ? cfg.extends : [cfg.extends];
     for (const entry of list) {
+      if (typeof entry !== "string") continue;
       const next = resolveExtends(entry, dir);
       if (!next) continue;
       const result = loadTsconfigWithExtends(next, visited);
@@ -128,11 +169,11 @@ function loadTsconfigWithExtends(tsconfigPath, visited = new Set()) {
 }
 
 /** Build the alias table for a tsconfig. */
-function buildAliases(tsconfigPath) {
+function buildAliases(tsconfigPath: string): Alias[] {
   const resolved = loadTsconfigWithExtends(tsconfigPath);
   if (!resolved) return [];
   const { paths, baseDir } = resolved;
-  const aliases = [];
+  const aliases: Alias[] = [];
   for (const [key, targets] of Object.entries(paths)) {
     if (!Array.isArray(targets)) continue;
     for (const target of targets) {
@@ -155,7 +196,7 @@ function buildAliases(tsconfigPath) {
 }
 
 /** Load aliases for the closest tsconfig to a given source file. */
-function loadAliasesForFile(filename) {
+function loadAliasesForFile(filename: string): Alias[] {
   const tsconfigPath = findTsconfig(path.dirname(filename)) ?? findTsconfig(process.cwd());
   if (!tsconfigPath) return [];
   let aliases = aliasCache.get(tsconfigPath);
@@ -175,7 +216,7 @@ function loadAliasesForFile(filename) {
  * do not provide it, resolving relative filenames against the lint context's
  * cwd rather than the JS plugin process's cwd.
  */
-function getPhysicalFilename(context) {
+function getPhysicalFilename(context: Context): string | null {
   const filename = context.physicalFilename ?? context.filename;
   if (
     typeof filename !== "string" ||
@@ -194,7 +235,11 @@ function getPhysicalFilename(context) {
  * Reverse-map an absolute import path to a tsconfig-defined bare specifier.
  * Returns null if no alias exposes this file.
  */
-function tryReverseAlias(absoluteImport, importerDir, aliases) {
+function tryReverseAlias(
+  absoluteImport: string,
+  importerDir: string,
+  aliases: readonly Alias[],
+): string | null {
   const stripped = absoluteImport.replace(STRIP_EXT_RE, "");
   for (const a of aliases) {
     const targetPrefix = a.targetPrefix.replace(STRIP_EXT_RE, "");
@@ -229,7 +274,7 @@ function tryReverseAlias(absoluteImport, importerDir, aliases) {
   return null;
 }
 
-const rule = {
+const rule = defineRule({
   meta: {
     type: "suggestion",
     docs: {
@@ -239,9 +284,9 @@ const rule = {
     fixable: "code",
   },
   createOnce(context) {
-    function check(node) {
+    function check(node: ImportNode): void {
       const source = node.source;
-      if (!source || typeof source.value !== "string") return;
+      if (!source || source.type !== "Literal" || typeof source.value !== "string") return;
       const importPath = source.value;
       if (!importPath.startsWith(".")) return;
       const filename = getPhysicalFilename(context);
@@ -269,9 +314,9 @@ const rule = {
       ImportExpression: check,
     };
   },
-};
+});
 
-export default {
+export default definePlugin({
   meta: { name: "vinext-local" },
   rules: { "prefer-import-alias": rule },
-};
+});

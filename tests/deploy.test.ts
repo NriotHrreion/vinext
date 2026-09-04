@@ -13,6 +13,7 @@ import {
   buildWranglerDeployArgs,
   getZeroPercentStagingTraffic,
   parseDeployArgs,
+  projectRequiresRouteCacheabilityProbeManifest,
   resolveWorkerNameForVersionOverride,
   resolveWranglerBin,
   runWranglerKVBulkPut,
@@ -69,6 +70,7 @@ import {
   parseCdnWarmupDeploymentUrl,
   parseWorkerDeploymentUrl,
 } from "../packages/cloudflare/src/worker-deployment-url.js";
+import { formatDeployHelp } from "../packages/cloudflare/src/deploy-help.js";
 
 // ─── Test Helpers ────────────────────────────────────────────────────────────
 
@@ -706,6 +708,35 @@ describe("parseDeployArgs", () => {
     expect(cliSource).toMatch(/config:\s*parsed\.config/);
   });
 
+  it("forwards phase-specific warmup budgets through the deploy CLI", () => {
+    const cliSource = fs.readFileSync(
+      path.join(process.cwd(), "packages/cloudflare/src/cli.ts"),
+      "utf-8",
+    );
+
+    for (const option of [
+      "warmCdnDiscoveryTimeout",
+      "warmCdnDiscoveryRetries",
+      "warmCdnProbeTimeout",
+      "warmCdnProbeRetries",
+      "warmCdnCertify",
+      "warmCdnReadinessTimeout",
+      "warmCdnReadinessRetries",
+      "warmCdnTarget",
+    ]) {
+      expect(cliSource).toContain(`${option}: parsed.${option}`);
+    }
+  });
+
+  it("forwards verbose output control through the deploy CLI", () => {
+    const cliSource = fs.readFileSync(
+      path.join(process.cwd(), "packages/cloudflare/src/cli.ts"),
+      "utf-8",
+    );
+
+    expect(cliSource).toContain("verbose: parsed.verbose");
+  });
+
   it("defaults to production deploy with no flags", () => {
     const parsed = parseDeployArgs([]);
     expect(parsed.preview).toBe(false);
@@ -713,8 +744,23 @@ describe("parseDeployArgs", () => {
     expect(parsed.name).toBeUndefined();
     expect(parsed.skipBuild).toBe(false);
     expect(parsed.dryRun).toBe(false);
+    expect(parsed.verbose).toBe(false);
     expect(parsed.warmCdnCache).toBe(false);
+    expect(parsed.warmCdnTarget).toBeUndefined();
+    expect(parsed.warmCdnCertify).toBe(false);
     expect(parsed.dangerouslyPromoteOnCdnWarmError).toBe(false);
+  });
+
+  it("requires CDN warming when certification is requested", () => {
+    expect(() => parseDeployArgs(["--warm-cdn-certify"])).toThrow(
+      "--warm-cdn-certify requires --experimental-warm-cdn-cache.",
+    );
+  });
+
+  it("requires CDN warming when an explicit warm target is requested", () => {
+    expect(() => parseDeployArgs(["--warm-cdn-target", "https://app.example.com"])).toThrow(
+      "--warm-cdn-target requires --experimental-warm-cdn-cache.",
+    );
   });
 
   it("parses --env with space-separated value", () => {
@@ -740,10 +786,17 @@ describe("parseDeployArgs", () => {
   });
 
   it("parses boolean flags", () => {
-    const parsed = parseDeployArgs(["--preview", "--skip-build", "--dry-run"]);
+    const parsed = parseDeployArgs(["--preview", "--skip-build", "--dry-run", "--verbose"]);
     expect(parsed.preview).toBe(true);
     expect(parsed.skipBuild).toBe(true);
     expect(parsed.dryRun).toBe(true);
+    expect(parsed.verbose).toBe(true);
+  });
+
+  it("documents verbose Wrangler output and no-progress probe timeouts", () => {
+    const help = formatDeployHelp();
+    expect(help).toContain("--verbose");
+    expect(help).toContain("Abort when cacheability probing makes no progress");
   });
 
   it("parses numeric TPR flags from string values", () => {
@@ -789,11 +842,19 @@ describe("parseDeployArgs", () => {
   it("parses CDN warmup flags", () => {
     const parsed = parseDeployArgs([
       "--experimental-warm-cdn-cache",
+      "--warm-cdn-target=https://app.example.com/",
       "--warm-cdn-concurrency",
       "6",
       "--warm-cdn-timeout=1500",
       "--warm-cdn-retries",
       "0",
+      "--warm-cdn-discovery-timeout=90000",
+      "--warm-cdn-discovery-retries=7",
+      "--warm-cdn-probe-timeout=60000",
+      "--warm-cdn-probe-retries=4",
+      "--warm-cdn-certify",
+      "--warm-cdn-readiness-timeout=45000",
+      "--warm-cdn-readiness-retries=9",
       "--warm-cdn-readiness-probes=8",
       "--warm-cdn-readiness-probe-delay",
       "750",
@@ -804,15 +865,36 @@ describe("parseDeployArgs", () => {
     ]);
 
     expect(parsed.warmCdnCache).toBe(true);
+    expect(parsed.warmCdnTarget).toBe("https://app.example.com");
     expect(parsed.warmCdnConcurrency).toBe(6);
     expect(parsed.warmCdnTimeout).toBe(1500);
     expect(parsed.warmCdnRetries).toBe(0);
+    expect(parsed.warmCdnDiscoveryTimeout).toBe(90_000);
+    expect(parsed.warmCdnDiscoveryRetries).toBe(7);
+    expect(parsed.warmCdnProbeTimeout).toBe(60_000);
+    expect(parsed.warmCdnProbeRetries).toBe(4);
+    expect(parsed.warmCdnCertify).toBe(true);
+    expect(parsed.warmCdnReadinessTimeout).toBe(45_000);
+    expect(parsed.warmCdnReadinessRetries).toBe(9);
     expect(parsed.warmCdnReadinessProbes).toBe(8);
     expect(parsed.warmCdnReadinessProbeDelay).toBe(750);
     expect(parsed.dangerouslyPromoteOnCdnWarmError).toBe(true);
     expect(parsed.warmCdnPromote).toBe(false);
     expect(parsed.warmCdnPromotionDelay).toBe(2500);
     expect(parsed.warmCdnIncludeFallbacks).toBe(true);
+  });
+
+  it.each([
+    "http://app.example.com",
+    "https://app.example.com/path",
+    "https://app.example.com?preview=1",
+    "https://user@app.example.com",
+    "https://app.example.com:8443",
+    "not-a-url",
+  ])("rejects invalid CDN warm target %s", (target) => {
+    expect(() =>
+      parseDeployArgs(["--experimental-warm-cdn-cache", "--warm-cdn-target", target]),
+    ).toThrow("--warm-cdn-target expects an HTTPS origin");
   });
 
   it("promotes warmed Worker versions by default", () => {
@@ -835,6 +917,24 @@ describe("parseDeployArgs", () => {
     );
     expect(() => parseDeployArgs(["--warm-cdn-retries=-1"])).toThrow(
       '--warm-cdn-retries expects a non-negative integer, but got "-1".',
+    );
+    expect(() => parseDeployArgs(["--warm-cdn-discovery-timeout=0"])).toThrow(
+      '--warm-cdn-discovery-timeout expects a positive integer, but got "0".',
+    );
+    expect(() => parseDeployArgs(["--warm-cdn-discovery-retries=-1"])).toThrow(
+      '--warm-cdn-discovery-retries expects a non-negative integer, but got "-1".',
+    );
+    expect(() => parseDeployArgs(["--warm-cdn-probe-timeout=0"])).toThrow(
+      '--warm-cdn-probe-timeout expects a positive integer, but got "0".',
+    );
+    expect(() => parseDeployArgs(["--warm-cdn-probe-retries=-1"])).toThrow(
+      '--warm-cdn-probe-retries expects a non-negative integer, but got "-1".',
+    );
+    expect(() => parseDeployArgs(["--warm-cdn-readiness-timeout=0"])).toThrow(
+      '--warm-cdn-readiness-timeout expects a positive integer, but got "0".',
+    );
+    expect(() => parseDeployArgs(["--warm-cdn-readiness-retries=-1"])).toThrow(
+      '--warm-cdn-readiness-retries expects a non-negative integer, but got "-1".',
     );
     expect(() => parseDeployArgs(["--warm-cdn-readiness-probes=0"])).toThrow(
       '--warm-cdn-readiness-probes expects a positive integer, but got "0".',
@@ -1025,6 +1125,32 @@ describe("detectProject", () => {
     mkdir(tmpDir, "app");
     writeFile(tmpDir, "next.config.ts", "export default { cacheComponents: true };");
     expect(detectProject(tmpDir).hasISR).toBe(true);
+  });
+});
+
+describe("route cacheability probe manifest deployment", () => {
+  const cacheConfig = {
+    cdn: {
+      adapter: "cloudflare-cdn-adapter",
+      capabilities: { routeCacheability: "probe-manifest" as const },
+    },
+  };
+
+  it.each([
+    [{ isAppRouter: true, isPagesRouter: false }, true],
+    [{ isAppRouter: false, isPagesRouter: true }, true],
+    [{ isAppRouter: false, isPagesRouter: false }, false],
+  ])("requires the two-stage flow for router project %#", (project, expected) => {
+    expect(projectRequiresRouteCacheabilityProbeManifest(project, cacheConfig)).toBe(expected);
+  });
+
+  it("does not require probing without a manifest-capable CDN adapter", () => {
+    expect(
+      projectRequiresRouteCacheabilityProbeManifest(
+        { isAppRouter: false, isPagesRouter: true },
+        null,
+      ),
+    ).toBe(false);
   });
 });
 
@@ -1741,8 +1867,9 @@ describe("readPagesRouterEntrySource", () => {
     // now called inside runPagesRequest. The worker delegates to the pipeline.
     expect(content).toContain("runPagesRequest(request, deps)");
     expect(content).toContain('result.type === "response"');
+    expect(content).toContain("return finalize(");
     expect(content).toContain(
-      "return finalizeMissingStaticAssetResponse(result.response, missingBuildAsset)",
+      "finalizeMissingStaticAssetResponse(result.response, missingBuildAsset)",
     );
   });
 
@@ -3667,6 +3794,7 @@ describe("getZeroPercentStagingTraffic", () => {
     expect(
       getZeroPercentStagingTraffic(
         {
+          deploymentId: null,
           versions: [
             { versionId: "11111111-1111-4111-8111-111111111111", percentage: 100 },
             { versionId: "33333333-3333-4333-8333-333333333333", percentage: 0 },
@@ -3685,6 +3813,7 @@ describe("getZeroPercentStagingTraffic", () => {
     expect(
       getZeroPercentStagingTraffic(
         {
+          deploymentId: null,
           versions: [
             { versionId: "11111111-1111-4111-8111-111111111111", percentage: 50 },
             { versionId: "33333333-3333-4333-8333-333333333333", percentage: 50 },
@@ -3700,6 +3829,7 @@ describe("getZeroPercentStagingTraffic", () => {
     expect(
       getZeroPercentStagingTraffic(
         {
+          deploymentId: null,
           versions: [{ versionId: "22222222-2222-4222-8222-222222222222", percentage: 100 }],
           output: "{}",
         },

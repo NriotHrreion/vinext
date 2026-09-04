@@ -56,14 +56,16 @@ type CdnAdapterOptions = {
   versionMetadataBinding?: string;
 };
 
-function versionValidationFailure(message: string): Response {
-  return new Response(`[vinext] ${message}\n`, {
-    status: 503,
-    headers: {
-      "Cache-Control": "no-store",
-      "Content-Type": "text/plain; charset=utf-8",
+function versionValidationFailure(message: string, status = 500): Response {
+  return Response.json(
+    { error: message },
+    {
+      status,
+      headers: {
+        "Cache-Control": "no-store",
+      },
     },
-  });
+  );
 }
 
 const CACHEABLE_EDGE_DIRECTIVE_RE = /(?:^|,)\s*(?:s-maxage|max-age)\s*=/i;
@@ -180,6 +182,9 @@ function formatCacheTag(tags: readonly string[]): string | null {
 }
 
 export class CloudflareCdnCacheAdapter implements CdnCacheAdapter {
+  readonly requiresCompletedResponseAdmission = true;
+  readonly responseVary = "verbatim" as const;
+
   constructor(
     private readonly versionMetadata?: WorkerVersionMetadata,
     private readonly versionMetadataBinding = DEFAULT_VERSION_METADATA_BINDING,
@@ -206,6 +211,7 @@ export class CloudflareCdnCacheAdapter implements CdnCacheAdapter {
     if (expectedVersionId !== this.versionMetadata.id) {
       return versionValidationFailure(
         `Cloudflare invoked Worker version ${this.versionMetadata.id}, but vinext warmup expected ${expectedVersionId}.`,
+        503,
       );
     }
     return null;
@@ -237,6 +243,14 @@ export class CloudflareCdnCacheAdapter implements CdnCacheAdapter {
   }
 
   buildResponseHeaders(input: CdnCacheableHeaderInput): CdnResponseHeaders {
+    // App Page MISS streams may discover request-bound dynamic APIs after the
+    // response object is created. Only the outer Worker admission boundary may
+    // replace this private policy after clean EOF; without that proof, the CDN
+    // must fail closed.
+    if (input.pendingDynamicCheck) {
+      return clearCloudflareCdnResponseHeaders(NO_STORE);
+    }
+
     // No cacheable policy → nobody stores it.
     if (!input.cacheControl) {
       return clearCloudflareCdnResponseHeaders(NO_STORE);

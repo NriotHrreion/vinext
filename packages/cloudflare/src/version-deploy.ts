@@ -28,6 +28,7 @@ export type WranglerVersionTraffic = {
 };
 
 export type WranglerDeploymentStatus = {
+  deploymentId: string | null;
   versions: WranglerVersionTraffic[];
   output: string;
 };
@@ -109,7 +110,9 @@ export function parseWranglerVersionUploadOutput(output: string): WranglerVersio
 }
 
 export function buildWranglerVersionUploadArgs(
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config"> & { previewAlias?: string },
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose"> & {
+    previewAlias?: string;
+  },
 ): WranglerVersionArgs {
   const args = ["versions", "upload"];
   const env = options.env || (options.preview ? "preview" : undefined);
@@ -130,7 +133,7 @@ export function buildWranglerVersionUploadArgs(
 
 export function buildWranglerVersionDeployArgs(
   versionTraffic: readonly WranglerVersionTraffic[],
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
 ): WranglerVersionArgs {
   const args = [
     "versions",
@@ -152,7 +155,7 @@ export function buildWranglerVersionDeployArgs(
 }
 
 export function buildWranglerDeploymentsStatusArgs(
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
 ): WranglerVersionArgs {
   const args = ["deployments", "status", "--json"];
   const env = options.env || (options.preview ? "preview" : undefined);
@@ -169,7 +172,7 @@ export function buildWranglerDeploymentsStatusArgs(
 }
 
 export function buildWranglerTriggersDeployArgs(
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
 ): WranglerVersionArgs {
   const args = ["triggers", "deploy"];
   const env = options.env || (options.preview ? "preview" : undefined);
@@ -189,6 +192,7 @@ function runWranglerCommand(
   root: string,
   args: string[],
   execute: typeof execFileSync = execFileSync,
+  verbose = false,
 ): string {
   const wranglerBin = resolveWranglerBin(root);
   const invocation = buildNodeCliInvocation(wranglerBin, args);
@@ -199,7 +203,7 @@ function runWranglerCommand(
     shell: false,
   };
   const output = execute(invocation.file, invocation.args, execOpts) as string;
-  if (output.trim()) {
+  if (verbose && output.trim()) {
     for (const line of output.trim().split("\n")) {
       console.log(`  ${line}`);
     }
@@ -261,12 +265,16 @@ export function parseWranglerDeploymentStatusOutput(output: string): WranglerDep
     throw new Error("Could not parse `wrangler deployments status --json` output.");
   }
 
-  return { versions: parseDeploymentVersions(parsed), output };
+  const deployment = Array.isArray(parsed) ? parsed.at(-1) : parsed;
+  const deploymentId = findStringInRecord(deployment, ["id", "deployment_id", "deploymentId"]);
+  return { deploymentId, versions: parseDeploymentVersions(parsed), output };
 }
 
 export function runWranglerVersionUpload(
   root: string,
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config"> & { previewAlias?: string },
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose"> & {
+    previewAlias?: string;
+  },
   execute: typeof execFileSync = execFileSync,
 ): WranglerVersionUploadResult {
   const { args, env } = buildWranglerVersionUploadArgs(options);
@@ -276,7 +284,9 @@ export function runWranglerVersionUpload(
     console.log("\n  Uploading Worker version for production...");
   }
   try {
-    return parseWranglerVersionUploadOutput(runWranglerCommand(root, args, execute));
+    return parseWranglerVersionUploadOutput(
+      runWranglerCommand(root, args, execute, options.verbose === true),
+    );
   } catch (error) {
     if (isMissingWorkerVersionUploadError(error)) {
       throw withInitialDeployRequiredMessage();
@@ -288,7 +298,7 @@ export function runWranglerVersionUpload(
 export function runWranglerVersionDeploy(
   root: string,
   versionTraffic: readonly WranglerVersionTraffic[],
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
   phase: "stage" | "promote-warmed" | "promote-uploaded" = "promote-uploaded",
   execute: typeof execFileSync = execFileSync,
 ): WranglerVersionDeployResult {
@@ -301,27 +311,31 @@ export function runWranglerVersionDeploy(
   } else {
     console.log(`\n  Promoting uploaded Worker version to ${target}...`);
   }
-  const output = runWranglerCommand(root, args, execute);
+  const output = runWranglerCommand(root, args, execute, options.verbose === true);
   return { deployedUrl: parseWorkersDevUrl(output), output };
 }
 
 export function runWranglerDeploymentStatus(
   root: string,
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
   execute: typeof execFileSync = execFileSync,
 ): WranglerDeploymentStatus {
   const { args, env } = buildWranglerDeploymentsStatusArgs(options);
-  if (env) {
-    console.log(`\n  Reading current Worker deployment for env: ${env}...`);
-  } else {
-    console.log("\n  Reading current Worker deployment...");
+  if (options.verbose) {
+    if (env) {
+      console.log(`\n  Reading current Worker deployment for env: ${env}...`);
+    } else {
+      console.log("\n  Reading current Worker deployment...");
+    }
   }
-  return parseWranglerDeploymentStatusOutput(runWranglerCommand(root, args, execute));
+  return parseWranglerDeploymentStatusOutput(
+    runWranglerCommand(root, args, execute, options.verbose === true),
+  );
 }
 
 export function runWranglerTriggersDeploy(
   root: string,
-  options: Pick<DeployOptions, "preview" | "env" | "name" | "config">,
+  options: Pick<DeployOptions, "preview" | "env" | "name" | "config" | "verbose">,
   execute: typeof execFileSync = execFileSync,
 ): WranglerVersionDeployResult {
   const { args, env } = buildWranglerTriggersDeployArgs(options);
@@ -330,6 +344,6 @@ export function runWranglerTriggersDeploy(
   } else {
     console.log("\n  Applying Worker triggers...");
   }
-  const output = runWranglerCommand(root, args, execute);
+  const output = runWranglerCommand(root, args, execute, options.verbose === true);
   return { deployedUrl: parseCdnWarmupDeploymentUrl(output), output };
 }

@@ -26,10 +26,13 @@ import "./server-globals.js";
 import rscHandler, {
   __assetPrefix as __rscAssetPrefix,
   __basePath as __rscBasePath,
+  __cacheabilityManifest as __rscCacheabilityManifest,
   __imageAllowedWidths as __rscImageAllowedWidths,
   __imageConfig as __rscImageConfig,
+  __prerenderSecret as __rscPrerenderSecret,
 } from "virtual:vinext-rsc-entry";
 import { runWithExecutionContext, type ExecutionContextLike } from "vinext/shims/request-context";
+import { getCdnCacheAdapter } from "vinext/shims/cdn-cache";
 // @ts-expect-error -- virtual module resolved by vinext at build time
 import { registerConfiguredCacheAdapters } from "virtual:vinext-cache-adapters";
 import { applyCdnResponseIdentityHeaders, validateCdnRequest } from "./cache-control.js";
@@ -50,7 +53,15 @@ import {
   filterInternalHeaders,
   isOpenRedirectShaped,
 } from "./request-pipeline.js";
-import { VINEXT_PRERENDER_ROUTE_PARAMS_HEADER, VINEXT_REVALIDATE_HOST_HEADER } from "./headers.js";
+import {
+  NEXT_ACTION_HEADER,
+  RSC_ACTION_HEADER,
+  VINEXT_CACHEABILITY_PROBE_HEADER,
+  VINEXT_CACHEABILITY_PROBE_QUERY_PARAM,
+  VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
+  VINEXT_PRERENDER_SECRET_HEADER,
+  VINEXT_REVALIDATE_HOST_HEADER,
+} from "./headers.js";
 import {
   readTrustedPrerenderRouteParams,
   serializePrerenderRouteParamsHeader,
@@ -62,6 +73,10 @@ import {
 } from "./http-error-responses.js";
 import { assetPrefixPathname, isNextStaticPath } from "../utils/asset-prefix.js";
 import { createWorkerRevalidationContext } from "./worker-revalidation-context.js";
+import {
+  createWorkerPrerenderDiscoveryContext,
+  createWorkerPrerenderReadinessResponse,
+} from "./worker-prerender-discovery.js";
 
 // Precompute the path components used for `_next/static/*` 404 short-circuit
 // detection. Both `__basePath` and `__assetPrefix` are inlined as
@@ -76,6 +91,13 @@ type WorkerAssetEnv = {
     fetch(request: Request): Promise<Response> | Response;
   };
 };
+
+function isPotentialCompletedAdmissionRequest(request: Request): boolean {
+  if (request.method !== "GET" && request.method !== "HEAD") return false;
+  if (request.headers.has(NEXT_ACTION_HEADER) || request.headers.has(RSC_ACTION_HEADER))
+    return false;
+  return true;
+}
 
 export default {
   async fetch(
@@ -96,14 +118,71 @@ async function handleRequest(
   // server-owned loopback origin and must retain its HTTP revalidation path.
   // Cloudflare requests instead receive an in-process dispatcher so the
   // credential never leaves the Worker isolate.
-  const ctx = platformCtx?.trustedRevalidateOrigin
+  const requestCtx = platformCtx?.trustedRevalidateOrigin
     ? platformCtx
     : createWorkerRevalidationContext(platformCtx, (internalRequest, internalCtx) =>
         handleRequest(internalRequest, env, internalCtx),
       );
-
-  // Register config-driven cache adapters before any rendering touches the cache.
+  // Registration must precede admission setup: the active adapter declares
+  // whether a completed response is required before public cache headers.
   registerConfiguredCacheAdapters(env as Record<string, unknown> | undefined);
+  const cdnCacheAdapter = getCdnCacheAdapter();
+  let ctx = createWorkerPrerenderDiscoveryContext(requestCtx, request, __rscPrerenderSecret);
+  const readinessResponse = createWorkerPrerenderReadinessResponse(ctx, request);
+  if (readinessResponse) {
+    return (await validateCdnRequest(request)) ?? readinessResponse;
+  }
+  let finalizeCacheabilityResponse:
+    | ((response: Response, ctx: ExecutionContextLike) => Promise<Response>)
+    | undefined;
+  if (request.headers.has(VINEXT_CACHEABILITY_PROBE_HEADER)) {
+    // Keep the capture/classification runtime out of every ordinary request.
+    // Authentication still happens before internal headers are removed below.
+    const cacheability = await import("./cacheability-request.js");
+    const probeContext = cacheability.createWorkerCacheabilityContext(
+      ctx,
+      request,
+      __rscPrerenderSecret,
+      cdnCacheAdapter.responseVary,
+    );
+    if (probeContext !== ctx) {
+      ctx = probeContext;
+      finalizeCacheabilityResponse = cacheability.finalizeWorkerCacheabilityResponse;
+      // A staged version can propagate at different times for different edge
+      // cache keys. The deploy client varies this reserved query value on each
+      // retry, but application routing and dynamic API observation must see
+      // the original request identity.
+      const probeUrl = new URL(request.url);
+      if (probeUrl.searchParams.has(VINEXT_CACHEABILITY_PROBE_QUERY_PARAM)) {
+        probeUrl.searchParams.delete(VINEXT_CACHEABILITY_PROBE_QUERY_PARAM);
+        request = new Request(probeUrl, request);
+      }
+    }
+  }
+  const requiresCompletedResponseAdmission =
+    cdnCacheAdapter.requiresCompletedResponseAdmission === true;
+  if (
+    !finalizeCacheabilityResponse &&
+    (__rscCacheabilityManifest || requiresCompletedResponseAdmission) &&
+    isPotentialCompletedAdmissionRequest(request)
+  ) {
+    const cacheability = await import("./cacheability-request.js");
+    const admissionContext = cacheability.createWorkerCacheabilityAdmissionContext(
+      ctx,
+      request,
+      __rscCacheabilityManifest,
+      process.env.__VINEXT_BUILD_ID,
+      requiresCompletedResponseAdmission,
+      cdnCacheAdapter.responseVary,
+    );
+    if (admissionContext !== ctx) {
+      ctx = admissionContext;
+      finalizeCacheabilityResponse = cacheability.finalizeWorkerCacheabilityResponse;
+    }
+  }
+
+  // Register the image adapter before rendering can touch it. Cache adapters
+  // were registered above because cacheability admission depends on them.
   registerConfiguredImageOptimizer(env as Record<string, unknown> | undefined);
 
   const cdnValidationResponse = await validateCdnRequest(request);
@@ -164,6 +243,7 @@ async function handleRequest(
     const filteredHeaders = ctx.isInternalPagesRevalidation
       ? new Headers(request.headers)
       : filterInternalHeaders(request.headers);
+    filteredHeaders.delete(VINEXT_PRERENDER_SECRET_HEADER);
     filteredHeaders.delete(VINEXT_REVALIDATE_HOST_HEADER);
     const prerenderRouteParamsHeader = serializePrerenderRouteParamsHeader(
       trustedPrerenderRouteParams,
@@ -196,12 +276,15 @@ async function handleRequest(
       });
       if (assetResponse) response = assetResponse;
     }
-    return finalizeMissingStaticAssetResponse(response, missingBuildAsset);
+    response = finalizeMissingStaticAssetResponse(response, missingBuildAsset);
+    return finalizeCacheabilityResponse ? finalizeCacheabilityResponse(response, ctx) : response;
   }
 
   if (result === null || result === undefined) {
-    return missingBuildAsset ? notFoundStaticAssetResponse() : notFoundResponse();
+    const response = missingBuildAsset ? notFoundStaticAssetResponse() : notFoundResponse();
+    return finalizeCacheabilityResponse ? finalizeCacheabilityResponse(response, ctx) : response;
   }
 
-  return new Response(String(result), { status: 200 });
+  const response = new Response(String(result), { status: 200 });
+  return finalizeCacheabilityResponse ? finalizeCacheabilityResponse(response, ctx) : response;
 }

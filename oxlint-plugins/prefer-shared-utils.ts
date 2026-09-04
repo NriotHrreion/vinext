@@ -1,5 +1,5 @@
 /**
- * Oxlint JS plugin: prefer-shared-utils.
+ * Oxlint plugin: prefer-shared-utils.
  *
  * Reports local redefinitions of shared helpers. The protected helper list is
  * derived from the actual helper modules at lint startup, so adding a new
@@ -12,6 +12,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { definePlugin, defineRule, type Context, type Node } from "@oxlint/plugins";
 
 const VINEXT_SOURCE_SEGMENT = "/packages/vinext/src/";
 const VINEXT_SOURCE_ROOT = "packages/vinext/src";
@@ -42,17 +44,17 @@ const EXPORT_VARIABLE_RE =
   /^export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)\b[^=]*=\s*(?:async\s*)?(?:function\b|\([^)]*\)(?:\s*:\s*[^=]+?)?\s*=>|[A-Za-z_$][\w$]*\s*(?:=>|;))/gm;
 const EXPORT_NAMED_RE = /^export\s*\{([^}]+)\}\s*(?:from\s*["'][^"']+["'])?\s*;?/gm;
 
-function normalizeFilename(filename) {
+function normalizeFilename(filename: string) {
   return filename.split(path.sep).join("/");
 }
 
-function escapeRegExp(value) {
+function escapeRegExp(value: string): string {
   return value.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 }
 
-function readExportedFunctionNames(absPath) {
+function readExportedFunctionNames(absPath: string): string[] {
   const source = fs.readFileSync(absPath, "utf-8");
-  const exportNames = new Set();
+  const exportNames = new Set<string>();
   for (const match of source.matchAll(EXPORT_FUNCTION_RE)) {
     exportNames.add(match[1]);
   }
@@ -71,7 +73,7 @@ function readExportedFunctionNames(absPath) {
   return Array.from(exportNames);
 }
 
-function listUtilsModules(srcRootAbs) {
+function listUtilsModules(srcRootAbs: string): string[] {
   const utilsDir = path.join(srcRootAbs, "utils");
   const entries = fs.readdirSync(utilsDir, { withFileTypes: true });
   return entries
@@ -106,11 +108,11 @@ const SHARED_UTILITY_DECLARATION =
         "g",
       );
 
-function maskRange(source, start, end) {
+function maskRange(source: string, start: number, end: number) {
   return `${source.slice(0, start)}${" ".repeat(end - start)}${source.slice(end)}`;
 }
 
-function maskCommentsAndQuotedStrings(source, options = { scanTemplateBodies: true }) {
+function maskCommentsAndQuotedStrings(source: string, options = { scanTemplateBodies: true }) {
   let masked = source;
   let i = 0;
   while (i < masked.length) {
@@ -176,20 +178,20 @@ function maskCommentsAndQuotedStrings(source, options = { scanTemplateBodies: tr
   return masked;
 }
 
-function isCanonicalDefinitionFile(filename, modulePath) {
+function isCanonicalDefinitionFile(filename: string, modulePath: string) {
   return filename.endsWith(`/packages/vinext/src/${modulePath}`);
 }
 
-function isVinextSourceFile(filename) {
+function isVinextSourceFile(filename: string) {
   return filename.includes(VINEXT_SOURCE_SEGMENT);
 }
 
-function isLintedProjectFile(filename) {
+function isLintedProjectFile(filename: string) {
   if (isVinextSourceFile(filename)) return true;
   return filename.startsWith(`${normalizeFilename(REPO_ROOT)}/tests/`);
 }
 
-function reportIfSharedUtility(context, filename, node, name) {
+function reportIfSharedUtility(context: Context, filename: string, node: Node, name: string) {
   const utility = SHARED_UTILS.get(name);
   if (!utility || isCanonicalDefinitionFile(filename, utility.modulePath)) return;
 
@@ -199,7 +201,7 @@ function reportIfSharedUtility(context, filename, node, name) {
   });
 }
 
-const rule = {
+const rule = defineRule({
   meta: {
     type: "suggestion",
     docs: {
@@ -225,9 +227,9 @@ const rule = {
       },
     };
   },
-};
+});
 
-export default {
+export default definePlugin({
   meta: { name: "vinext-utils" },
   rules: { "prefer-shared-utils": rule },
-};
+});

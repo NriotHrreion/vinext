@@ -16,8 +16,10 @@ declare module "virtual:vinext-rsc-entry" {
   export default rscHandler;
   export const __assetPrefix: string;
   export const __basePath: string;
+  export const __cacheabilityManifest: string | null;
   export const __hasPagesDir: boolean;
   export const __imageAllowedWidths: number[];
+  export const __prerenderSecret: string;
   export const __imageConfig: {
     qualities?: number[];
     dangerouslyAllowSVG?: boolean;

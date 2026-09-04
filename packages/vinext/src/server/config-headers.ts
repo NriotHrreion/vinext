@@ -5,8 +5,52 @@ import {
   type RequestContext,
 } from "../config/config-matchers.js";
 import type { HeaderRecord } from "./request-pipeline.js";
+import {
+  CACHEABILITY_POLICY_HEADERS,
+  markRouteCacheabilityDynamic,
+  markRouteCacheabilityExplicitConfigPolicy,
+  markRouteCacheabilityFinalResponseUncacheable,
+} from "vinext/shims/cacheability-classification";
+import { isNonCacheableCacheControl } from "vinext/shims/cdn-cache";
 
 const ADDITIVE_CONFIG_HEADER_NAMES = new Set(["set-cookie", "vary"]);
+const CACHEABILITY_POLICY_HEADER_NAMES = new Set<string>(CACHEABILITY_POLICY_HEADERS);
+
+function markConditionalConfigHeaderCacheability(rule: NextHeader): void {
+  if (
+    [...(rule.has ?? []), ...(rule.missing ?? [])].some(
+      (condition) =>
+        condition.type === "header" || condition.type === "cookie" || condition.type === "host",
+    )
+  ) {
+    // Query values are already part of the public Workers Cache key. Headers,
+    // cookies, and hostnames are not, so a response header selected by any of
+    // them cannot be shared safely under the request URL.
+    markRouteCacheabilityDynamic(
+      "next.config headers depend on request headers, cookies, or hostnames",
+    );
+  }
+}
+
+function markExplicitConfigResponseVeto(
+  matched: ReadonlyArray<{ key: string; value: string }>,
+): void {
+  for (const header of matched) {
+    const name = header.key.toLowerCase();
+    if (name === "set-cookie") {
+      markRouteCacheabilityFinalResponseUncacheable("next.config headers set a cookie");
+      continue;
+    }
+    if (CACHEABILITY_POLICY_HEADER_NAMES.has(name)) {
+      markRouteCacheabilityExplicitConfigPolicy();
+    }
+    if (CACHEABILITY_POLICY_HEADER_NAMES.has(name) && isNonCacheableCacheControl(header.value)) {
+      markRouteCacheabilityFinalResponseUncacheable(
+        `next.config headers set a non-cacheable ${header.key} policy`,
+      );
+    }
+  }
+}
 
 type ApplyConfigHeadersOptions = {
   configHeaders: NextHeader[];
@@ -89,8 +133,10 @@ export function applyConfigHeadersToResponse(
       options.configHeaders,
       options.requestContext,
       options.basePathState,
+      markConditionalConfigHeaderCacheability,
     ),
   );
+  markExplicitConfigResponseVeto(matched);
   for (const header of matched) {
     const lowerName = header.key.toLowerCase();
     if (lowerName === "link") {
@@ -101,6 +147,14 @@ export function applyConfigHeadersToResponse(
         header.key,
         postConfigLink ? `${header.value}, ${postConfigLink}` : header.value,
       );
+    } else if (
+      !ADDITIVE_CONFIG_HEADER_NAMES.has(lowerName) &&
+      options.middlewareHeaders?.has(lowerName)
+    ) {
+      // Middleware runs after next.config headers in Next.js, so it remains
+      // authoritative even when this config field may replace a renderer-owned
+      // default (notably Cache-Control).
+      continue;
     } else if (ADDITIVE_CONFIG_HEADER_NAMES.has(lowerName)) {
       responseHeaders.append(header.key, header.value);
     } else if (options.overwriteExisting?.has(lowerName) || !responseHeaders.has(lowerName)) {
@@ -120,8 +174,10 @@ export function applyConfigHeadersToHeaderRecord(
       options.configHeaders,
       options.requestContext,
       options.basePathState,
+      markConditionalConfigHeaderCacheability,
     ),
   );
+  markExplicitConfigResponseVeto(matched);
   for (const header of matched) {
     const lowerName = header.key.toLowerCase();
     if (lowerName === "set-cookie") {

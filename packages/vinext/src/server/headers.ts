@@ -37,6 +37,15 @@ export const VINEXT_TIMING_HEADER = "x-vinext-timing";
 /** Expected Worker version asserted by vinext staged warmup requests. */
 export const VINEXT_EXPECTED_WORKER_VERSION_HEADER = "X-Vinext-Expected-Worker-Version";
 
+/** Authenticated staged-Worker request asking for a completed App Page classification. */
+export const VINEXT_CACHEABILITY_PROBE_HEADER = "X-Vinext-Cacheability-Probe";
+
+/**
+ * Per-attempt cache buster used while a newly staged Worker version propagates.
+ * Authenticated probe requests remove it before middleware or route code runs.
+ */
+export const VINEXT_CACHEABILITY_PROBE_QUERY_PARAM = "__vinext_cacheability_probe";
+
 export {
   VINEXT_MW_CTX_HEADER,
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
@@ -53,6 +62,12 @@ export const VINEXT_PRERENDER_PAGES_STATIC_PATHS_PATH = "/__vinext/prerender/pag
 
 /** Internal endpoint used to enumerate cached dynamic metadata route paths. */
 export const VINEXT_PRERENDER_METADATA_ROUTES_PATH = "/__vinext/prerender/metadata-routes";
+
+/** Internal endpoint used to verify staged Worker version routing without rendering a route. */
+export const VINEXT_PRERENDER_READINESS_PATH = "/__vinext/prerender/readiness";
+
+/** Response marker proving the staged Worker readiness short-circuit handled the request. */
+export const VINEXT_PRERENDER_READINESS_HEADER = "X-Vinext-Prerender-Readiness";
 
 /** TPR (Tailored Per-Request) revalidation interval in seconds. */
 export const VINEXT_REVALIDATE_HEADER = "x-vinext-revalidate";
@@ -268,6 +283,7 @@ export const INTERNAL_HEADERS = [
 
 /** Vinext-only internal headers stripped alongside Next.js protocol internals. */
 export const VINEXT_INTERNAL_HEADERS = [
+  VINEXT_CACHEABILITY_PROBE_HEADER.toLowerCase(),
   VINEXT_EXPECTED_WORKER_VERSION_HEADER.toLowerCase(),
   VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
   VINEXT_PRERENDER_SPECULATIVE_HEADER,

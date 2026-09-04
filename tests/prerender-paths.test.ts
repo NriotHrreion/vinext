@@ -40,6 +40,18 @@ describe("prerender path manifest", () => {
         }
         if (
           url.pathname === "/__vinext/prerender/static-params" &&
+          url.searchParams.get("pattern") === "/policy/:slug"
+        ) {
+          return Response.json([{ slug: "ordinary" }, { slug: "special" }]);
+        }
+        if (
+          url.pathname === "/__vinext/prerender/static-params" &&
+          url.searchParams.get("pattern") === "/unlisted/:slug"
+        ) {
+          return Response.json([{ slug: "known" }]);
+        }
+        if (
+          url.pathname === "/__vinext/prerender/static-params" &&
           url.searchParams.get("pattern") === "/:path+"
         ) {
           return Response.json([
@@ -66,6 +78,12 @@ describe("prerender path manifest", () => {
           url.searchParams.get("pattern") === "/:category"
         ) {
           return Response.json([{ category: "news" }]);
+        }
+        if (
+          url.pathname === "/__vinext/prerender/static-params" &&
+          url.searchParams.get("pattern") === "/api/items/:slug"
+        ) {
+          return Response.json([{ slug: "one" }, { slug: "two" }]);
         }
         return new Response(null, { status: 204 });
       }),
@@ -108,11 +126,34 @@ describe("prerender path manifest", () => {
     });
 
     expect(manifest).toEqual({
+      appPaths: ["/", "/dynamic", "/cached/intro", "/cached/featured"],
       buildId: "build-a",
       buildIdentity: "rsc-build-a",
       loadingShellPaths: ["/cached/intro", "/cached/featured"],
       rscBuildId: "rsc-build-a",
       responseVary: "verbatim",
+      routePatterns: {
+        "/": {
+          cacheabilityProbe: { canPrunePattern: true },
+          kind: "app-page",
+          pattern: "/",
+        },
+        "/cached/featured": {
+          cacheabilityProbe: { canPrunePattern: true },
+          kind: "app-page",
+          pattern: "/cached/:slug",
+        },
+        "/cached/intro": {
+          cacheabilityProbe: { canPrunePattern: true },
+          kind: "app-page",
+          pattern: "/cached/:slug",
+        },
+        "/dynamic": {
+          cacheabilityProbe: { canPrunePattern: true },
+          kind: "app-page",
+          pattern: "/dynamic",
+        },
+      },
       rscPaths: ["/", "/dynamic", "/cached/intro", "/cached/featured"],
       trailingSlash: false,
       paths: ["/", "/dynamic", "/cached/intro", "/cached/featured"],
@@ -134,6 +175,400 @@ describe("prerender path manifest", () => {
       }),
     );
     expect(closeMock).toHaveBeenCalledOnce();
+  });
+
+  it("marks probe collapses unsafe when config cache policy varies by path or request", async () => {
+    // Next.js applies pathname-specific custom Cache-Control to dynamic App
+    // routes and evaluates has/missing conditions against each request:
+    // test/e2e/app-dir/custom-cache-control/custom-cache-control.test.ts
+    // test/e2e/custom-routes/custom-routes.test.ts
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile(
+      "app/policy/[slug]/page.tsx",
+      [
+        "export const dynamic = 'force-dynamic';",
+        "export function generateStaticParams() { return [{ slug: 'ordinary' }, { slug: 'special' }]; }",
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+    writeFile(
+      "app/conditional/page.tsx",
+      "export const dynamic = 'force-dynamic'; export default function Page() { return null; }\n",
+    );
+    writeFile("app/cookie/page.tsx", "export default function Page() { return null; }\n");
+    writeFile(
+      "app/unlisted/[slug]/page.tsx",
+      [
+        "export const dynamic = 'force-dynamic';",
+        "export function generateStaticParams() { return [{ slug: 'known' }]; }",
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+    writeFile("app/wildcard/path/page.tsx", "export default function Page() { return null; }\n");
+    writeFile(
+      "next.config.mjs",
+      [
+        "export default {",
+        "  headers: async () => [",
+        "    { source: '/policy/special', headers: [{ key: 'Cache-Control', value: 's-maxage=60' }] },",
+        "    { source: '/conditional', missing: [{ type: 'query', key: '_rsc' }], headers: [{ key: 'Cache-Control', value: 's-maxage=60' }] },",
+        "    { source: '/cookie', has: [{ type: 'query', key: '_rsc', value: '.*' }], headers: [{ key: 'Set-Cookie', value: 'rsc=1' }] },",
+        "    { source: '/unlisted/public-only', headers: [{ key: 'Cache-Control', value: 's-maxage=60' }] },",
+        "    { source: '/wildcard/*', missing: [{ type: 'query', key: '_rsc', value: '.*' }], headers: [{ key: 'Cache-Control', value: 's-maxage=60' }] },",
+        "  ],",
+        "};",
+      ].join("\n"),
+    );
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({
+      root: tmpDir,
+      buildIdentity: "response-header",
+      responseVary: "verbatim",
+    });
+
+    expect(manifest?.routePatterns).toMatchObject({
+      "/conditional": {
+        cacheabilityProbe: { canPrunePattern: false },
+      },
+      "/cookie": {
+        cacheabilityProbe: { canPrunePattern: true },
+      },
+      "/policy/ordinary": {
+        cacheabilityProbe: { canPrunePattern: false },
+      },
+      "/policy/special": {
+        cacheabilityProbe: { canPrunePattern: false },
+      },
+      "/unlisted/known": {
+        cacheabilityProbe: { canPrunePattern: false },
+      },
+      "/wildcard/path": {
+        cacheabilityProbe: { canPrunePattern: false },
+      },
+    });
+  });
+
+  it("discovers only Next.js-static Route Handler GET identities", async () => {
+    // Ported from Next.js static eligibility and dynamic Route Handler params:
+    // packages/next/src/server/route-modules/app-route/helpers/is-static-gen-enabled.ts
+    // test/e2e/app-dir/app-static/app-static.test.ts
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile(
+      "app/api/static/route.ts",
+      "export const revalidate = 60; export function GET() { return Response.json({ ok: true }); }",
+    );
+    writeFile(
+      "app/api/dynamic/route.ts",
+      "export function GET(request) { return Response.json({ url: request.url }); }",
+    );
+    writeFile(
+      "app/api/items/[slug]/route.ts",
+      [
+        "export const revalidate = false;",
+        "export function generateStaticParams() { return [{ slug: 'one' }, { slug: 'two' }]; }",
+        "export function GET(_request, { params }) { return Response.json(params); }",
+      ].join("\n"),
+    );
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({
+      root: tmpDir,
+      buildIdentity: "response-header",
+      responseVary: "verbatim",
+    });
+
+    expect(manifest?.routeHandlerPaths).toEqual([
+      "/api/static",
+      "/api/items/one",
+      "/api/items/two",
+    ]);
+    expect(manifest?.paths).toEqual([]);
+    expect(manifest?.rscPaths).toEqual([]);
+  });
+
+  it("discovers dynamic paths from an uploaded Worker without loading its bundle in Node", async () => {
+    // No Next.js test port applies: staged Worker version overrides and
+    // cloudflare:workers bindings are Cloudflare-specific.
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+    writeFile("dist/server/index.js", 'import { env } from "cloudflare:workers";\n');
+    writeFile(
+      "dist/server/vinext-server.json",
+      JSON.stringify({ prerenderSecret: "staged-discovery-secret" }),
+    );
+    writeFile(
+      "app/cached/[slug]/page.tsx",
+      [
+        'import { env } from "cloudflare:workers";',
+        "export const revalidate = 60;",
+        "export async function generateStaticParams() { await env.KV.get('paths'); return []; }",
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({
+      root: tmpDir,
+      pathDiscoveryTarget: {
+        baseUrl: "https://workers-cache.example.workers.dev/ignored-prefix",
+        headers: {
+          "Cloudflare-Workers-Version-Overrides": 'workers-cache="version-b"',
+          "X-Vinext-Expected-Worker-Version": "version-b",
+        },
+      },
+    });
+
+    expect(manifest?.paths).toEqual(["/cached/intro", "/cached/featured"]);
+    expect(startProdServerMock).not.toHaveBeenCalled();
+    const [requestUrl, requestInit] = vi.mocked(fetch).mock.calls[0];
+    const requestHeaders = new Headers(requestInit?.headers);
+    expect(requestUrl).toBe(
+      "https://workers-cache.example.workers.dev/__vinext/prerender/static-params?pattern=%2Fcached%2F%3Aslug",
+    );
+    expect(requestHeaders.get("Cloudflare-Workers-Version-Overrides")).toBe(
+      'workers-cache="version-b"',
+    );
+    expect(requestHeaders.get("X-Vinext-Expected-Worker-Version")).toBe("version-b");
+    expect(requestHeaders.get("x-vinext-prerender-secret")).toBe("staged-discovery-secret");
+  });
+
+  it("retries transient staged-version routing failures during remote discovery", async () => {
+    // No Next.js test port applies: Worker version propagation is Cloudflare-specific.
+    const remoteFetch = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response("old Worker", { status: 404 }))
+      .mockResolvedValueOnce(new Response("version still propagating", { status: 500 }))
+      .mockResolvedValueOnce(Response.json([{ slug: "intro" }]));
+    vi.stubGlobal("fetch", remoteFetch);
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/index.js", 'import { env } from "cloudflare:workers";\n');
+    writeFile(
+      "dist/server/vinext-server.json",
+      JSON.stringify({ prerenderSecret: "staged-discovery-secret" }),
+    );
+    writeFile(
+      "app/cached/[slug]/page.tsx",
+      [
+        "export const revalidate = 60;",
+        "export async function generateStaticParams() { return []; }",
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({
+      root: tmpDir,
+      pathDiscoveryTarget: {
+        baseUrl: "https://workers-cache.example.workers.dev",
+        retries: 2,
+        retryDelayMs: 0,
+      },
+    });
+
+    expect(manifest?.paths).toEqual(["/cached/intro"]);
+    expect(remoteFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("uses the full discovery phase when no retry limit is configured", async () => {
+    // No Next.js test port applies: Worker version propagation is Cloudflare-specific.
+    let attempts = 0;
+    const remoteFetch = vi.fn<typeof fetch>(async () => {
+      attempts++;
+      return attempts <= 61
+        ? new Response("old Worker", { status: 404 })
+        : Response.json([{ slug: "intro" }]);
+    });
+    vi.stubGlobal("fetch", remoteFetch);
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/index.js", 'import { env } from "cloudflare:workers";\n');
+    writeFile(
+      "dist/server/vinext-server.json",
+      JSON.stringify({ prerenderSecret: "staged-discovery-secret" }),
+    );
+    writeFile(
+      "app/cached/[slug]/page.tsx",
+      "export async function generateStaticParams() { return []; } export default function Page() { return null; }",
+    );
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({
+      root: tmpDir,
+      pathDiscoveryTarget: {
+        baseUrl: "https://workers-cache.example.workers.dev",
+        phaseTimeoutMs: 120_000,
+        retryDelayMs: 0,
+      },
+    });
+
+    expect(manifest?.paths).toEqual(["/cached/intro"]);
+    expect(remoteFetch).toHaveBeenCalledTimes(62);
+  });
+
+  it("reports exhausted discovery attempts and the last transient status", async () => {
+    // No Next.js test port applies: Worker version propagation is Cloudflare-specific.
+    const remoteFetch = vi.fn<typeof fetch>(
+      async () => new Response("old Worker", { status: 503 }),
+    );
+    vi.stubGlobal("fetch", remoteFetch);
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/index.js", 'import { env } from "cloudflare:workers";\n');
+    writeFile(
+      "dist/server/vinext-server.json",
+      JSON.stringify({ prerenderSecret: "staged-discovery-secret" }),
+    );
+    writeFile(
+      "app/cached/[slug]/page.tsx",
+      "export async function generateStaticParams() { return []; } export default function Page() { return null; }",
+    );
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    await expect(
+      emitPrerenderPathManifest({
+        root: tmpDir,
+        pathDiscoveryTarget: {
+          baseUrl: "https://workers-cache.example.workers.dev",
+          retries: 1,
+          retryDelayMs: 0,
+        },
+      }),
+    ).rejects.toThrow(
+      "path discovery returned HTTP 503 after 2 attempt(s); last transient status was HTTP 503",
+    );
+    expect(remoteFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("bounds all remote discovery retries by one phase deadline", async () => {
+    // No Next.js test port applies: staged Worker discovery is Cloudflare-specific.
+    const remoteFetch = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response("old Worker", { status: 503 }))
+      .mockResolvedValueOnce(new Response("old Worker", { status: 503 }))
+      // The phase deadline remains authoritative even if fetch ignores abort.
+      .mockImplementation(() => new Promise<Response>(() => {}));
+    vi.stubGlobal("fetch", remoteFetch);
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/index.js", 'import { env } from "cloudflare:workers";\n');
+    writeFile(
+      "dist/server/vinext-server.json",
+      JSON.stringify({ prerenderSecret: "staged-discovery-secret" }),
+    );
+    writeFile(
+      "app/cached/[slug]/page.tsx",
+      "export async function generateStaticParams() { return []; } export default function Page() { return null; }",
+    );
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const discovery = emitPrerenderPathManifest({
+      root: tmpDir,
+      pathDiscoveryTarget: {
+        baseUrl: "https://workers-cache.example.workers.dev",
+        phaseTimeoutMs: 100,
+        retries: 60,
+        retryDelayMs: 10,
+      },
+    });
+    await expect(discovery).rejects.toThrow(
+      "remote path discovery exceeded its 100ms phase deadline",
+    );
+    expect(remoteFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not replay user-code failures during remote discovery", async () => {
+    // No Next.js test port applies: staged Worker discovery is Cloudflare-specific.
+    const remoteFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({ error: "binding lookup failed" }, { status: 500 }),
+    );
+    vi.stubGlobal("fetch", remoteFetch);
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile(
+      "dist/server/vinext-server.json",
+      JSON.stringify({ prerenderSecret: "staged-discovery-secret" }),
+    );
+    writeFile(
+      "app/cached/[slug]/page.tsx",
+      "export async function generateStaticParams() { return []; } export default function Page() { return null; }",
+    );
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    await expect(
+      emitPrerenderPathManifest({
+        root: tmpDir,
+        pathDiscoveryTarget: {
+          baseUrl: "https://workers-cache.example.workers.dev",
+          retries: 3,
+          retryDelayMs: 0,
+        },
+      }),
+    ).rejects.toThrow("path discovery returned HTTP 500: binding lookup failed");
+    expect(remoteFetch).toHaveBeenCalledOnce();
+  });
+
+  it("discovers binding-backed Pages Router paths from the uploaded Worker", async () => {
+    // No Next.js test port applies: staged Worker version overrides and
+    // cloudflare:workers bindings are Cloudflare-specific.
+    const remoteFetch = vi.fn<typeof fetch>(async () =>
+      Response.json({ fallback: false, paths: [{ params: { slug: "intro" } }] }),
+    );
+    vi.stubGlobal("fetch", remoteFetch);
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "pages-build-a\n");
+    writeFile("dist/server/entry.js", 'import { env } from "cloudflare:workers";\n');
+    writeFile(
+      "dist/server/vinext-server.json",
+      JSON.stringify({ prerenderSecret: "pages-discovery-secret" }),
+    );
+    writeFile(
+      "pages/posts/[slug].tsx",
+      [
+        'import { env } from "cloudflare:workers";',
+        "export async function getStaticPaths() { await env.KV.get('paths'); return { fallback: false, paths: [] }; }",
+        "export function getStaticProps() { return { props: {} }; }",
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({
+      root: tmpDir,
+      pathDiscoveryTarget: {
+        baseUrl: "https://pages-cache.example.workers.dev",
+        headers: { "Cloudflare-Workers-Version-Overrides": 'pages-cache="version-b"' },
+      },
+    });
+
+    expect(manifest?.paths).toEqual(["/posts/intro"]);
+    expect(manifest?.pagesPaths).toEqual(["/posts/intro"]);
+    expect(startProdServerMock).not.toHaveBeenCalled();
+    const [requestUrl, requestInit] = remoteFetch.mock.calls[0];
+    expect(requestUrl).toBe(
+      "https://pages-cache.example.workers.dev/__vinext/prerender/pages-static-paths?pattern=%2Fposts%2F%3Aslug",
+    );
+    expect(new Headers(requestInit?.headers).get("x-vinext-prerender-secret")).toBe(
+      "pages-discovery-secret",
+    );
   });
 
   it("discovers strict-Vary RSC paths without consulting completed prerender output", async () => {
@@ -465,9 +900,275 @@ describe("prerender path manifest", () => {
     });
 
     expect(manifest?.paths).toEqual(["/pages-dir/static", "/pages-dir/foobar", "/specific/value"]);
+    expect(manifest?.appPaths).toEqual(["/pages-dir/static", "/specific/value"]);
     expect(manifest?.rscPaths).toEqual(["/pages-dir/static", "/specific/value"]);
     expect(manifest?.loadingShellPaths).toEqual(["/specific/value"]);
-    expect(manifest?.pagesPaths).toEqual([]);
+    expect(manifest?.pagesPaths).toEqual(["/pages-dir/foobar"]);
+  });
+
+  it("retains empty generateStaticParams patterns for on-demand admission", async () => {
+    // Ported from Next.js: test/e2e/app-dir/fallback-prefetch
+    // https://github.com/vercel/next.js/tree/canary/test/e2e/app-dir/fallback-prefetch
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile(
+      "app/posts/[slug]/page.tsx",
+      [
+        "export function generateStaticParams() { return []; }",
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+    vi.mocked(fetch).mockResolvedValue(Response.json([]));
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({
+      root: tmpDir,
+      responseVary: "verbatim",
+    });
+
+    expect(manifest?.paths).toEqual([]);
+    expect(manifest?.fallbackRoutePatterns).toEqual([
+      { kind: "app-page", pattern: "/posts/:slug" },
+    ]);
+  });
+
+  it("rejects empty generateStaticParams for a Cache Components App Page", async () => {
+    // Ported from Next.js: test/e2e/app-dir/empty-generate-static-params
+    // https://github.com/vercel/next.js/tree/canary/test/e2e/app-dir/empty-generate-static-params
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("next.config.js", "export default { cacheComponents: true };\n");
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile(
+      "app/posts/[slug]/page.tsx",
+      [
+        "export function generateStaticParams() { return []; }",
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+    vi.mocked(fetch).mockResolvedValue(Response.json([]));
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+
+    await expect(
+      emitPrerenderPathManifest({ root: tmpDir, responseVary: "verbatim" }),
+    ).rejects.toThrow(
+      "When using Cache Components, all `generateStaticParams` functions must return at least one result.",
+    );
+  });
+
+  it.each([
+    [
+      "empty generateStaticParams",
+      [
+        "export function generateStaticParams() { return []; }",
+        "export function GET() { return Response.json({ ok: true }); }",
+      ].join("\n"),
+      Response.json([]),
+    ],
+    [
+      "empty generateStaticParams with Cache Components",
+      [
+        "export function generateStaticParams() { return []; }",
+        "export function GET() { return Response.json({ ok: true }); }",
+      ].join("\n"),
+      Response.json([]),
+      true,
+    ],
+    [
+      "force-static without generateStaticParams",
+      [
+        'export const dynamic = "force-static";',
+        "export function GET() { return Response.json({ ok: true }); }",
+      ].join("\n"),
+      new Response(null, { status: 204 }),
+      false,
+    ],
+  ])(
+    "retains dynamic App Route Handler patterns with %s",
+    async (_name, source, response, cacheComponents = false) => {
+      // Ported from Next.js static App Route eligibility:
+      // packages/next/src/server/route-modules/app-route/helpers/is-static-gen-enabled.ts
+      writeFile("package.json", JSON.stringify({ type: "module" }));
+      if (cacheComponents) {
+        writeFile("next.config.js", "export default { cacheComponents: true };\n");
+      }
+      writeFile("dist/server/BUILD_ID", "build-a\n");
+      writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+      writeFile("dist/server/index.js", "export default {};\n");
+      writeFile("app/api/layout.tsx", 'export const dynamic = "force-dynamic";\n');
+      writeFile("app/api/posts/[slug]/route.ts", source);
+      vi.mocked(fetch).mockResolvedValue(response);
+
+      const { emitPrerenderPathManifest } =
+        await import("../packages/vinext/src/build/prerender-paths.js");
+      const manifest = await emitPrerenderPathManifest({ root: tmpDir, responseVary: "verbatim" });
+
+      expect(manifest?.routeHandlerPaths).toBeUndefined();
+      expect(manifest?.fallbackRoutePatterns).toEqual([
+        { kind: "app-route", pattern: "/api/posts/:slug" },
+      ]);
+    },
+  );
+
+  it.each([
+    [true, true],
+    ["blocking", true],
+    [false, false],
+  ] as const)(
+    "retains zero-path Pages fallback=%s eligibility as a pattern record",
+    async (fallback, shouldRetain) => {
+      // Ported from Next.js:
+      // test/e2e/prerender/pages/non-json/[p].js
+      // test/e2e/prerender/pages/non-json-blocking/[p].js
+      writeFile("package.json", JSON.stringify({ type: "module" }));
+      writeFile("dist/server/BUILD_ID", "build-a\n");
+      writeFile("dist/server/entry.js", "export default {};\n");
+      writeFile(
+        "pages/posts/[slug].tsx",
+        [
+          "export function getStaticPaths() { return { paths: [], fallback: false }; }",
+          "export function getStaticProps() { return { props: {}, revalidate: 60 }; }",
+          "export default function Page() { return null; }",
+        ].join("\n"),
+      );
+      vi.mocked(fetch).mockResolvedValue(Response.json({ fallback, paths: [] }));
+
+      const { emitPrerenderPathManifest } =
+        await import("../packages/vinext/src/build/prerender-paths.js");
+      const manifest = await emitPrerenderPathManifest({ root: tmpDir });
+
+      expect(manifest?.paths).toEqual([]);
+      expect(manifest?.fallbackRoutePatterns).toEqual(
+        shouldRetain ? [{ kind: "pages-page", pattern: "/posts/:slug" }] : undefined,
+      );
+    },
+  );
+
+  it("retains force-static patterns without generateStaticParams", async () => {
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile(
+      "app/posts/[slug]/page.tsx",
+      [
+        'export const dynamic = "force-static";',
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 204 }));
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({ root: tmpDir, responseVary: "verbatim" });
+
+    expect(manifest?.fallbackRoutePatterns).toEqual([
+      { kind: "app-page", pattern: "/posts/:slug" },
+    ]);
+  });
+
+  it("does not certify an empty static params pattern beneath force-dynamic config", async () => {
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile("app/posts/layout.tsx", 'export const dynamic = "force-dynamic";\n');
+    writeFile(
+      "app/posts/[slug]/page.tsx",
+      [
+        'export const dynamic = "force-static";',
+        "export function generateStaticParams() { return []; }",
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+    vi.mocked(fetch).mockResolvedValue(Response.json([]));
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({ root: tmpDir, responseVary: "verbatim" });
+
+    expect(manifest?.fallbackRoutePatterns).toBeUndefined();
+  });
+
+  it("does not certify empty static params with a force-dynamic parallel default", async () => {
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile(
+      "app/posts/[slug]/page.tsx",
+      [
+        'export const dynamic = "force-static";',
+        "export function generateStaticParams() { return []; }",
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+    writeFile(
+      "app/posts/@sidebar/default.tsx",
+      [
+        'export const dynamic = "force-dynamic";',
+        "export default function Sidebar() { return null; }",
+      ].join("\n"),
+    );
+    vi.mocked(fetch).mockResolvedValue(Response.json([]));
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({ root: tmpDir, responseVary: "verbatim" });
+
+    expect(manifest?.fallbackRoutePatterns).toBeUndefined();
+  });
+
+  it("does not treat revalidate without generateStaticParams as a static fallback", async () => {
+    // Next.js only treats a dynamic route without generateStaticParams as static
+    // when its effective dynamic config is `error` or `force-static`.
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/index.ts
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile(
+      "app/posts/[slug]/page.tsx",
+      ["export const revalidate = 60;", "export default function Page() { return null; }"].join(
+        "\n",
+      ),
+    );
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 204 }));
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({ root: tmpDir, responseVary: "verbatim" });
+
+    expect(manifest?.fallbackRoutePatterns).toBeUndefined();
+  });
+
+  it("does not inherit force-static past an explicit child auto without generateStaticParams", async () => {
+    // Next.js uses the nested-most dynamic config on the main segment chain.
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/utils.ts#L1028
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/RSC_BUILD_ID", "rsc-build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile("app/posts/layout.tsx", 'export const dynamic = "force-static";\n');
+    writeFile(
+      "app/posts/[slug]/page.tsx",
+      ['export const dynamic = "auto";', "export default function Page() { return null; }"].join(
+        "\n",
+      ),
+    );
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 204 }));
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+    const manifest = await emitPrerenderPathManifest({ root: tmpDir, responseVary: "verbatim" });
+
+    expect(manifest?.fallbackRoutePatterns).toBeUndefined();
   });
 
   it("uses the runtime-best App route for App-only loading-shell discovery", async () => {
@@ -503,6 +1204,11 @@ describe("prerender path manifest", () => {
       "/specific/value",
     ]);
     expect(manifest?.paths).toEqual(["/pages-dir/static", "/pages-dir/foobar", "/specific/value"]);
+    expect(manifest?.appPaths).toEqual([
+      "/pages-dir/static",
+      "/pages-dir/foobar",
+      "/specific/value",
+    ]);
     expect(manifest?.loadingShellPaths).toEqual(["/specific/value"]);
   });
 
@@ -559,9 +1265,10 @@ describe("prerender path manifest", () => {
     });
 
     expect(manifest?.paths).toEqual(["/fr/api/status", "/fr/about", "/about"]);
+    expect(manifest?.appPaths).toEqual(["/fr/api/status"]);
     expect(manifest?.rscPaths).toEqual(["/fr/api/status"]);
     expect(manifest?.loadingShellPaths).toEqual(["/fr/api/status"]);
-    expect(manifest?.pagesPaths).toEqual(["/about", "/fr/about"]);
+    expect(manifest?.pagesPaths).toEqual(["/fr/about", "/about"]);
   });
 
   it("resolves Pages-discovered warm paths to their runtime App owner", async () => {
@@ -597,8 +1304,10 @@ describe("prerender path manifest", () => {
     });
 
     expect(manifest?.paths).toEqual(["/specific/value"]);
+    expect(manifest?.appPaths).toEqual(["/specific/value"]);
     expect(manifest?.rscPaths).toEqual(["/specific/value"]);
-    expect(manifest?.pagesPaths).toEqual(["/health", "/specific/value"]);
+    expect(manifest?.pagesPaths).toEqual([]);
+    expect(manifest?.pagesDataPaths).toEqual([]);
   });
 
   it("fails path discovery when generateStaticParams discovery aborts", async () => {
@@ -627,6 +1336,39 @@ describe("prerender path manifest", () => {
 
     await expect(emitPrerenderPathManifest({ root: tmpDir })).rejects.toThrow(
       "Failed to discover warmup path(s) for /cached/:slug: path discovery timed out after 30000ms",
+    );
+  });
+
+  it("explains how to move cloudflare:workers path discovery out of Node", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json(
+          {
+            error: "Error [ERR_UNSUPPORTED_ESM_URL_SCHEME]: Received protocol 'cloudflare:'",
+          },
+          { status: 500 },
+        ),
+      ),
+    );
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/index.js", "export default {};\n");
+    writeFile(
+      "app/cached/[slug]/page.tsx",
+      [
+        'import { env } from "cloudflare:workers";',
+        "export const revalidate = 60;",
+        "export async function generateStaticParams() { await env.KV.get('paths'); return []; }",
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+
+    await expect(emitPrerenderPathManifest({ root: tmpDir })).rejects.toThrow(
+      "Cloudflare runtime bindings cannot execute in the local Node prerender server. Use `vinext-cloudflare deploy --experimental-warm-cdn-cache`",
     );
   });
 
@@ -746,6 +1488,13 @@ describe("prerender path manifest", () => {
 
     expect(manifest?.paths).toEqual(["/pages-only"]);
     expect(manifest?.pagesPaths).toEqual(["/pages-only"]);
+    expect(manifest?.routePatterns).toEqual({
+      "/pages-only": {
+        cacheabilityProbe: { canPrunePattern: true },
+        kind: "pages-page",
+        pattern: "/pages-only",
+      },
+    });
   });
 
   it("excludes Pages API handlers from Pages-only concrete warm paths", async () => {
@@ -844,6 +1593,20 @@ describe("prerender path manifest", () => {
       "/posts/a%2fb",
     ]);
     expect(manifest?.pagesPaths).toEqual(manifest?.paths);
+    expect(manifest?.pagesDataPaths).toEqual([
+      "/docs/_next/data/build-a/en/posts/hello.json",
+      "/docs/_next/data/build-a/fr/posts/bonjour.json",
+      "/docs/_next/data/build-a/fr/posts/string-fr.json",
+      "/docs/_next/data/build-a/FR/posts/string-fr-upper.json",
+      "/docs/_next/data/build-a/en/posts/string-en-explicit.json",
+      "/docs/_next/data/build-a/en/posts/string-en.json",
+      "/docs/_next/data/build-a/en/posts/%7Euser.json",
+      "/docs/_next/data/build-a/en/posts/a%2fb.json",
+    ]);
+    expect(
+      manifest?.routePatterns?.["/docs/_next/data/build-a/en/posts/hello.json"]?.cacheabilityProbe
+        ?.concretePathname,
+    ).toBe("/docs/posts/hello");
     expect(fetch).toHaveBeenCalledWith(
       "http://127.0.0.1:43210/__vinext/prerender/pages-static-paths?pattern=%2Fposts%2F%3Aslug&locales=%5B%22en%22%2C%22fr%22%5D&defaultLocale=en",
       expect.any(Object),
@@ -997,6 +1760,38 @@ describe("prerender path manifest", () => {
     expect(manifest?.paths).toEqual(["/about"]);
     expect(manifest?.pagesPaths).toEqual(["/about"]);
     expect(manifest?.excludedWarmPaths).toEqual(["/fr/about"]);
+  });
+
+  it("discovers concrete getServerSideProps HTML and data identities", async () => {
+    writeFile("package.json", JSON.stringify({ type: "module" }));
+    writeFile("dist/server/BUILD_ID", "build-a\n");
+    writeFile("dist/server/entry.js", "export default {};\n");
+    writeFile(
+      "pages/gssp.tsx",
+      [
+        "export async function getServerSideProps() { return { props: {} }; }",
+        "export default function Page() { return null; }",
+      ].join("\n"),
+    );
+    const { emitPrerenderPathManifest } =
+      await import("../packages/vinext/src/build/prerender-paths.js");
+
+    const manifest = await emitPrerenderPathManifest({ root: tmpDir });
+
+    expect(manifest?.pagesPaths).toEqual(["/gssp"]);
+    expect(manifest?.pagesDataPaths).toEqual(["/_next/data/build-a/gssp.json"]);
+    expect(manifest?.routePatterns).toEqual({
+      "/_next/data/build-a/gssp.json": {
+        cacheabilityProbe: { canPrunePattern: true, concretePathname: "/gssp" },
+        kind: "pages-page",
+        pattern: "/gssp",
+      },
+      "/gssp": {
+        cacheabilityProbe: { canPrunePattern: true },
+        kind: "pages-page",
+        pattern: "/gssp",
+      },
+    });
   });
 
   it("does not reload disk config when supplied resolved config", async () => {

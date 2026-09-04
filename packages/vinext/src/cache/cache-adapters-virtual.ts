@@ -41,6 +41,23 @@ export type CdnCacheAdapterCapabilities = {
    * guarantee is present. URL-only caches retain the contextual `_rsc` digest.
    */
   responseVary?: "verbatim";
+  /**
+   * Cacheable App Page responses require a build-bound probe manifest before
+   * the adapter may emit public CDN cache policy. Cloudflare deploy tooling
+   * carries that manifest as a module in a second Worker version.
+   */
+  routeCacheability?: "probe-manifest";
+};
+
+export type CacheAdapterBuildOutput = {
+  /** Whether this adapter owns output for the resolved build platform. */
+  matchesBuild?: (build: { plugins: readonly { name?: string }[] }) => boolean;
+  /** Finalize an emitted directory after other platform output hooks. */
+  finalizeBuildOutput?: (output: {
+    root: string;
+    outDir: string;
+    isPrimaryServerOutput: boolean;
+  }) => Promise<void> | void;
 };
 
 export type CacheAdapterDescriptor<O extends Record<string, unknown> = Record<string, unknown>> = {
@@ -51,6 +68,8 @@ export type CacheAdapterDescriptor<O extends Record<string, unknown> = Record<st
   adapter: string;
   /** JSON-serializable options forwarded to the factory at runtime. */
   options?: O;
+  /** Optional adapter-owned finalization for platform-generated build output. */
+  output?: CacheAdapterBuildOutput;
   /** Build-time cache semantics used by shared request protocol code. */
   capabilities?: CdnCacheAdapterCapabilities;
 };
@@ -61,6 +80,10 @@ export function hasVerbatimResponseVary(cache?: VinextCacheConfig | null): boole
 
 export function hasBuildIdentityResponseHeader(cache?: VinextCacheConfig | null): boolean {
   return cache?.cdn?.capabilities?.buildIdentity === "response-header";
+}
+
+export function requiresRouteCacheabilityProbeManifest(cache?: VinextCacheConfig | null): boolean {
+  return cache?.cdn?.capabilities?.routeCacheability === "probe-manifest";
 }
 
 /**

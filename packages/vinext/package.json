@@ -1,6 +1,6 @@
 {
   "name": "vinext",
-  "version": "1.0.0-beta.8",
+  "version": "1.0.0-beta.9",
   "description": "Run Next.js apps on Vite. Drop-in replacement for the next CLI.",
   "homepage": "https://vinext.dev/",
   "license": "MIT",
@@ -99,6 +99,10 @@
     "./internal/server/pregenerated-concrete-paths": {
       "types": "./dist/server/pregenerated-concrete-paths.d.ts",
       "import": "./dist/server/pregenerated-concrete-paths.js"
+    },
+    "./internal/server/cacheability-manifest": {
+      "types": "./dist/server/cacheability-manifest.d.ts",
+      "import": "./dist/server/cacheability-manifest.js"
     },
     "./internal/build/run-prerender": {
       "types": "./dist/build/run-prerender.d.ts",

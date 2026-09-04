@@ -16,6 +16,7 @@ import {
   VINEXT_RSC_VARY_HEADER,
 } from "../packages/vinext/src/server/app-rsc-cache-busting.js";
 import { VINEXT_CDN_BUILD_ID_HEADER } from "../packages/cloudflare/src/cache/cdn-build-id.js";
+import { VINEXT_PRERENDER_READINESS_HEADER } from "../packages/vinext/src/server/headers.js";
 
 let tmpDir: string;
 
@@ -46,6 +47,18 @@ function cacheableHtml(body = "html"): Response {
       "cdn-cache-control": "public, max-age=60",
       "cf-cache-status": "MISS",
       "content-type": "text/html",
+      [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+    },
+  });
+}
+
+function cacheablePagesData(body = '{"pageProps":{}}'): Response {
+  return new Response(body, {
+    headers: {
+      "cache-control": "public, max-age=0, must-revalidate",
+      "cdn-cache-control": "public, max-age=60",
+      "cf-cache-status": "MISS",
+      "content-type": "application/json; charset=utf-8",
       [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
     },
   });
@@ -88,11 +101,18 @@ describe("Cloudflare CDN warmup", () => {
         buildId: "build-a",
         buildIdentity: "rsc-build-a",
         deploymentId: "dpl_123",
+        fallbackRoutePatterns: [
+          { kind: "app-page", pattern: "/posts/:slug" },
+          { kind: "app-route", pattern: "/api/posts/:slug" },
+          { kind: "pages-page", pattern: "/legacy/:slug" },
+        ],
         loadingShellPaths: ["/dashboard"],
+        pagesDataPaths: ["/docs/_next/data/build-a/pages.json"],
         paths: ["/dashboard", "/dynamic", "/pages"],
         responseVary: "verbatim",
         rscBuildId: "rsc-build-a",
         rscPaths: ["/dashboard", "/dynamic"],
+        routeHandlerPaths: ["/api/data"],
         trailingSlash: true,
       }),
     );
@@ -105,10 +125,17 @@ describe("Cloudflare CDN warmup", () => {
       buildId: "build-a",
       buildIdentity: "rsc-build-a",
       deploymentId: "dpl_123",
+      fallbackRoutePatterns: [
+        { kind: "app-page", pattern: "/posts/:slug" },
+        { kind: "app-route", pattern: "/api/posts/:slug" },
+        { kind: "pages-page", pattern: "/legacy/:slug" },
+      ],
       loadingShellPaths: ["/docs/dashboard/"],
+      pagesDataPaths: ["/docs/_next/data/build-a/pages.json"],
       paths: ["/docs/dashboard/", "/docs/dynamic/", "/docs/pages/"],
       rscBuildId: "rsc-build-a",
       rscPaths: ["/docs/dashboard/", "/docs/dynamic/"],
+      routeHandlerPaths: ["/docs/api/data/"],
     });
   });
 
@@ -192,10 +219,11 @@ describe("Cloudflare CDN warmup", () => {
     );
   });
 
-  it("warms canonical full RSC, loading shell, and HTML with browser-identical requests", async () => {
+  it("warms canonical RSC, HTML, and Pages data with browser-identical requests", async () => {
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       const headers = new Headers(init?.headers);
-      return headers.get("rsc") === "1" ? cacheableRsc() : cacheableHtml();
+      if (headers.get("rsc") === "1") return cacheableRsc();
+      return headers.get("accept") === "application/json" ? cacheablePagesData() : cacheableHtml();
     });
 
     const result = await warmCdnCache({
@@ -204,20 +232,28 @@ describe("Cloudflare CDN warmup", () => {
       expectedRscBuildId: "rsc-build-a",
       fetchImpl: fetchImpl as typeof fetch,
       loadingShellPaths: ["/search?q=x"],
+      pagesDataPaths: ["/_next/data/build-a/pages.json"],
       paths: ["/search?q=x"],
       rscPaths: ["/search?q=x"],
       targetUrl: "https://app.example.com",
     });
 
     expect(result).toEqual({
-      total: 3,
-      warmed: 3,
+      total: 4,
+      warmed: 4,
       skipped: 0,
       failed: 0,
       failures: [],
-      retryPlan: { loadingShellPaths: [], paths: [], rscPaths: [] },
+      skippedTargets: [],
+      warmedPlan: {
+        loadingShellPaths: ["/search?q=x"],
+        pagesDataPaths: ["/_next/data/build-a/pages.json"],
+        paths: ["/search?q=x"],
+        rscPaths: ["/search?q=x"],
+      },
+      retryPlan: { loadingShellPaths: [], pagesDataPaths: [], paths: [], rscPaths: [] },
     });
-    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl).toHaveBeenCalledTimes(4);
     const fullCall = fetchImpl.mock.calls.find((call) => {
       const headers = new Headers(call[1]?.headers);
       return headers.get("rsc") === "1" && !headers.has("next-router-prefetch");
@@ -227,13 +263,19 @@ describe("Cloudflare CDN warmup", () => {
       return headers.get("rsc") === "1" && headers.get("next-router-prefetch") === "1";
     });
     const htmlCall = fetchImpl.mock.calls.find(
-      (call) => new Headers(call[1]?.headers).get("rsc") !== "1",
+      (call) => new Headers(call[1]?.headers).get("accept") === "text/html",
+    );
+    const pagesDataCall = fetchImpl.mock.calls.find(
+      (call) => new Headers(call[1]?.headers).get("accept") === "application/json",
     );
     expect(requestHref(fullCall?.[0])).toBe("https://app.example.com/search?q=x&_rsc");
     expect(requestHref(shellCall?.[0])).toBe(
       "https://app.example.com/search?q=x&_rsc=9qLBDIU2NgN178cB",
     );
     expect(requestHref(htmlCall?.[0])).toBe("https://app.example.com/search?q=x");
+    expect(requestHref(pagesDataCall?.[0])).toBe(
+      "https://app.example.com/_next/data/build-a/pages.json",
+    );
 
     const full = new Headers(fullCall?.[1]?.headers);
     expect(Object.fromEntries(full)).toMatchObject({
@@ -254,9 +296,131 @@ describe("Cloudflare CDN warmup", () => {
 
     const html = new Headers(htmlCall?.[1]?.headers);
     expect(html.get("accept")).toBe("text/html");
+    expect(new Headers(pagesDataCall?.[1]?.headers).get("accept")).toBe("application/json");
     for (const call of fetchImpl.mock.calls) {
       expect(new Headers(call[1]?.headers).get("user-agent")).toBe("vinext-cloudflare-cdn-warm");
     }
+  });
+
+  it("warms Route Handlers with the canonical fetch request identity", async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("Accept")).toBe("*/*");
+      return cacheablePagesData('{"ok":true}');
+    });
+
+    const result = await warmCdnCache({
+      expectedBuildId: "build-a",
+      fetchImpl: fetchImpl as typeof fetch,
+      paths: [],
+      routeHandlerPaths: ["/api/data"],
+      targetUrl: "https://app.example.com",
+    });
+
+    expect(result.warmed).toBe(1);
+    expect(result.warmedPlan.routeHandlerPaths).toEqual(["/api/data"]);
+    expect(requestHref(fetchImpl.mock.calls[0]?.[0])).toBe("https://app.example.com/api/data");
+  });
+
+  it("reports planned and completed cache entries by route pattern", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const paths = ["/products/warmed", "/products/private", "/products/failed"];
+    const routePatterns = Object.fromEntries(
+      paths.map((pathname) => [
+        pathname,
+        {
+          cacheabilityProbe: { canPrunePattern: true },
+          kind: "app-page" as const,
+          pattern: "/products/:slug",
+        },
+      ]),
+    );
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const pathname = new URL(requestHref(input)!).pathname;
+      if (pathname === "/products/private") {
+        return new Response("private", {
+          headers: {
+            "cache-control": "no-store",
+            "cf-cache-status": "BYPASS",
+            "content-type": "text/html",
+            [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+          },
+        });
+      }
+      if (pathname === "/products/failed") {
+        return new Response("failed", {
+          status: 500,
+          headers: {
+            "content-type": "text/html",
+            [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+          },
+        });
+      }
+      return cacheableHtml();
+    });
+
+    await expect(
+      warmCdnCache({
+        expectedBuildId: "build-a",
+        fetchImpl: fetchImpl as typeof fetch,
+        paths,
+        retries: 0,
+        routePatterns,
+        targetUrl: "https://app.example.com",
+      }),
+    ).resolves.toMatchObject({ failed: 1, skipped: 1, warmed: 1 });
+
+    expect(log).toHaveBeenCalledWith("\n  Warming 3 CDN cache entries...");
+    expect(log).toHaveBeenCalledWith("  CDN warmup plan by route:");
+    expect(log).toHaveBeenCalledWith("    Route pattern    Kind      Paths  Entries");
+    expect(log).toHaveBeenCalledWith("    /products/:slug  App page      3        3");
+    expect(log).toHaveBeenCalledWith("  CDN warmup result by route:");
+    expect(log).toHaveBeenCalledWith("    Route pattern    Kind      Warmed  Skipped  Failed");
+    expect(log).toHaveBeenCalledWith("    /products/:slug  App page     1/3        1       1");
+    expect(log).toHaveBeenCalledWith("  CDN warmup: 1 warmed, 1 skipped, 1 failed.");
+  });
+
+  it("caps route reports without listing concrete paths for large apps", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const paths: string[] = [];
+    const routePatterns: Record<
+      string,
+      {
+        cacheabilityProbe: { canPrunePattern: boolean };
+        kind: "app-page";
+        pattern: string;
+      }
+    > = {};
+    for (let routeIndex = 0; routeIndex < 12; routeIndex++) {
+      const pattern = `/catalog-${String(routeIndex).padStart(2, "0")}/:slug`;
+      for (const slug of ["first", "second"]) {
+        const pathname = pattern.replace(":slug", slug);
+        paths.push(pathname);
+        routePatterns[pathname] = {
+          cacheabilityProbe: { canPrunePattern: true },
+          kind: "app-page",
+          pattern,
+        };
+      }
+    }
+
+    await warmCdnCache({
+      expectedBuildId: "build-a",
+      fetchImpl: (async () => cacheableHtml()) as typeof fetch,
+      paths,
+      retries: 0,
+      routePatterns,
+      targetUrl: "https://app.example.com",
+    });
+
+    const output = log.mock.calls.map(([message]) => String(message)).join("\n");
+    expect(output).toMatch(/\/catalog-00\/:slug\s+App page\s+2\s+2/);
+    expect(output).toMatch(/\/catalog-00\/:slug\s+App page\s+2\/2\s+0\s+0/);
+    expect(output.match(/2 additional route patterns omitted \(4 cache entries\)/g)).toHaveLength(
+      2,
+    );
+    expect(output).not.toContain("/catalog-00/first");
+    expect(output).not.toContain("/catalog-11/:slug");
   });
 
   it("counts coherent no-store/BYPASS responses as skipped, including in strict mode", async () => {
@@ -277,23 +441,123 @@ describe("Cloudflare CDN warmup", () => {
       });
     });
 
-    await expect(
-      warmCdnCache({
-        expectedRscBuildId: "rsc-build-a",
-        fetchImpl: fetchImpl as typeof fetch,
-        paths: ["/dynamic"],
-        rscPaths: ["/dynamic"],
-        strict: true,
-        targetUrl: "https://app.example.com",
-      }),
-    ).resolves.toEqual({
+    const result = await warmCdnCache({
+      expectedRscBuildId: "rsc-build-a",
+      fetchImpl: fetchImpl as typeof fetch,
+      paths: ["/dynamic"],
+      rscPaths: ["/dynamic"],
+      strict: true,
+      targetUrl: "https://app.example.com",
+    });
+    expect(result).toMatchObject({
       total: 2,
       warmed: 0,
       skipped: 2,
       failed: 0,
       failures: [],
-      retryPlan: { loadingShellPaths: [], paths: [], rscPaths: [] },
+      warmedPlan: { loadingShellPaths: [], pagesDataPaths: [], paths: [], rscPaths: [] },
+      retryPlan: { loadingShellPaths: [], pagesDataPaths: [], paths: [], rscPaths: [] },
     });
+    expect(result.skippedTargets).toHaveLength(2);
+  });
+
+  it("rejects a Pages data response with a non-JSON representation", async () => {
+    await expect(
+      warmCdnCache({
+        expectedBuildId: "build-a",
+        fetchImpl: (async () => cacheableHtml()) as typeof fetch,
+        pagesDataPaths: ["/_next/data/build-a/about.json"],
+        paths: [],
+        strict: true,
+        targetUrl: "https://app.example.com",
+      }),
+    ).rejects.toThrow("expected application/json response");
+  });
+
+  it("does not certify a staged cache fill until the entry is reusable", async () => {
+    let attempt = 0;
+    const fetchImpl = vi.fn(async () => {
+      attempt += 1;
+      const response = cacheableHtml();
+      response.headers.set("cf-cache-status", attempt === 1 ? "MISS" : "HIT");
+      return response;
+    });
+
+    await expect(
+      warmCdnCache({
+        expectedBuildId: "build-a",
+        fetchImpl: fetchImpl as typeof fetch,
+        paths: ["/staged"],
+        propagatingTarget: true,
+        requireCacheHit: true,
+        retries: 1,
+        retryDelayMs: 0,
+        strict: true,
+        targetUrl: "https://app.example.com",
+      }),
+    ).resolves.toMatchObject({ warmed: 1, failed: 0 });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a cache fill that becomes private during certification", async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response("dynamic", {
+          headers: {
+            "cache-control": "no-store",
+            "cf-cache-status": "BYPASS",
+            "content-type": "text/html",
+            [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+          },
+        }),
+    );
+
+    await expect(
+      warmCdnCache({
+        expectedBuildId: "build-a",
+        fetchImpl: fetchImpl as typeof fetch,
+        paths: ["/changed"],
+        requireCacheHit: true,
+        strict: true,
+        targetUrl: "https://app.example.com",
+      }),
+    ).rejects.toThrow("CF-Cache-Status is BYPASS; the cache fill is not reusable");
+  });
+
+  it("certifies from response headers without consuming the cached body", async () => {
+    let cancelled = false;
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream({
+            pull(controller) {
+              controller.enqueue(new Uint8Array([1]));
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          {
+            headers: {
+              "cf-cache-status": "HIT",
+              "content-type": "text/html",
+              [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+            },
+          },
+        ),
+    );
+
+    await expect(
+      warmCdnCache({
+        expectedBuildId: "build-a",
+        fetchImpl: fetchImpl as typeof fetch,
+        paths: ["/cached"],
+        requireCacheHit: true,
+        strict: true,
+        targetUrl: "https://app.example.com",
+      }),
+    ).resolves.toMatchObject({ warmed: 1, failed: 0 });
+    await vi.waitFor(() => expect(cancelled).toBe(true));
   });
 
   it("uses Cloudflare cache-control precedence when validating admission", async () => {
@@ -584,7 +848,7 @@ describe("Cloudflare CDN warmup", () => {
     ).resolves.toMatchObject({ warmed: 2, skipped: 0, failed: 0 });
   });
 
-  it("requires browser-reusable variance for cacheable terminal responses", async () => {
+  it("accepts custom Vary fields on cacheable terminal responses", async () => {
     const fetchImpl = vi.fn(async () => {
       const response = cacheableRsc("flight not found");
       response.headers.set("vary", `${VINEXT_RSC_VARY_HEADER}, User-Agent`);
@@ -601,7 +865,7 @@ describe("Cloudflare CDN warmup", () => {
         strict: true,
         targetUrl: "https://app.example.com",
       }),
-    ).rejects.toThrow("response Vary has unsupported field user-agent");
+    ).resolves.toMatchObject({ warmed: 1, skipped: 0, failed: 0 });
   });
 
   it("does not treat same-build server errors as terminal route responses", async () => {
@@ -646,7 +910,116 @@ describe("Cloudflare CDN warmup", () => {
         expectedRscBuildId: "rsc-build-a",
         fetchImpl: fetchImpl as typeof fetch,
         maxAttempts: 1,
-        plan: { loadingShellPaths: [], paths: [], rscPaths: ["/not-found"] },
+        plan: { loadingShellPaths: [], pagesDataPaths: [], paths: [], rscPaths: ["/not-found"] },
+        probeIntervalMs: 0,
+        requiredConsecutiveSuccesses: 1,
+        targetUrl: "https://app.example.com",
+      }),
+    ).resolves.toEqual({ ready: true });
+  });
+
+  it("uses the authenticated readiness endpoint instead of rendering an application route", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      const headers = new Headers(init?.headers);
+      expect(url.pathname).toBe("/__vinext/prerender/readiness");
+      expect(url.searchParams.has("__vinext_cdn_warm_readiness")).toBe(true);
+      expect(init?.method).toBe("POST");
+      expect(headers.get("accept")).toBe("text/html");
+      expect(headers.get("rsc")).toBeNull();
+      expect(headers.get("x-vinext-prerender-secret")).toBe("build-secret");
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "cache-control": "no-store",
+          [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+          [VINEXT_PRERENDER_READINESS_HEADER]: "1",
+        },
+      });
+    });
+
+    await expect(
+      waitForCdnWarmTargetReadiness({
+        expectedBuildId: "build-a",
+        expectedRscBuildId: "rsc-build-a",
+        fetchImpl: fetchImpl as typeof fetch,
+        maxAttempts: 1,
+        plan: { loadingShellPaths: [], pagesDataPaths: [], paths: [], rscPaths: ["/slow"] },
+        prerenderSecret: "build-secret",
+        probeIntervalMs: 0,
+        requiredConsecutiveSuccesses: 1,
+        targetUrl: "https://app.example.com",
+      }),
+    ).resolves.toEqual({ ready: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      label: "an application response",
+      response: new Response("fallback", {
+        headers: { [VINEXT_CDN_BUILD_ID_HEADER]: "build-a" },
+      }),
+    },
+    {
+      label: "a same-build 404",
+      response: new Response("not found", {
+        status: 404,
+        headers: { [VINEXT_CDN_BUILD_ID_HEADER]: "build-a" },
+      }),
+    },
+    {
+      label: "an unmarked 204",
+      response: new Response(null, {
+        status: 204,
+        headers: {
+          "cache-control": "no-store",
+          [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+        },
+      }),
+    },
+    {
+      label: "a cacheable marked 204",
+      response: new Response(null, {
+        status: 204,
+        headers: {
+          [VINEXT_CDN_BUILD_ID_HEADER]: "build-a",
+          [VINEXT_PRERENDER_READINESS_HEADER]: "1",
+        },
+      }),
+    },
+  ])("does not accept $label from the dedicated readiness path", async ({ response }) => {
+    const readiness = await waitForCdnWarmTargetReadiness({
+      expectedBuildId: "build-a",
+      fetchImpl: vi.fn(async () => response.clone()) as typeof fetch,
+      maxAttempts: 1,
+      plan: { loadingShellPaths: [], pagesDataPaths: [], paths: ["/slow"], rscPaths: [] },
+      prerenderSecret: "build-secret",
+      probeIntervalMs: 0,
+      requiredConsecutiveSuccesses: 1,
+      targetUrl: "https://app.example.com",
+    });
+
+    expect(readiness.ready).toBe(false);
+  });
+
+  it("uses a Pages data identity when it is the only staged readiness target", async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("accept")).toBe("application/json");
+      return cacheablePagesData();
+    });
+
+    await expect(
+      waitForCdnWarmTargetReadiness({
+        expectedBuildId: "build-a",
+        fetchImpl: fetchImpl as typeof fetch,
+        maxAttempts: 1,
+        plan: {
+          loadingShellPaths: [],
+          pagesDataPaths: ["/_next/data/build-a/about.json"],
+          paths: [],
+          rscPaths: [],
+        },
         probeIntervalMs: 0,
         requiredConsecutiveSuccesses: 1,
         targetUrl: "https://app.example.com",
@@ -671,7 +1044,7 @@ describe("Cloudflare CDN warmup", () => {
         expectedBuildId: "build-a",
         fetchImpl: fetchImpl as typeof fetch,
         maxAttempts: 1,
-        plan: { loadingShellPaths: [], paths: ["/"], rscPaths: [] },
+        plan: { loadingShellPaths: [], pagesDataPaths: [], paths: ["/"], rscPaths: [] },
         probeIntervalMs: 0,
         requiredConsecutiveSuccesses: 1,
         targetUrl: "https://app.example.com",
@@ -680,6 +1053,65 @@ describe("Cloudflare CDN warmup", () => {
       error: "HTTP 503; uploaded build was not stable for 1 consecutive probe(s)",
       ready: false,
     });
+  });
+
+  it("bounds readiness retries by an independent phase deadline", async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response("version validation failed", {
+          status: 503,
+          headers: { [VINEXT_CDN_BUILD_ID_HEADER]: "old-build" },
+        }),
+    );
+
+    const readiness = waitForCdnWarmTargetReadiness({
+      expectedBuildId: "build-a",
+      fetchImpl: fetchImpl as typeof fetch,
+      maxAttempts: 100,
+      phaseTimeoutMs: 25,
+      plan: { loadingShellPaths: [], pagesDataPaths: [], paths: ["/"], rscPaths: [] },
+      probeIntervalMs: 10,
+      requiredConsecutiveSuccesses: 1,
+      targetUrl: "https://app.example.com",
+    });
+
+    await expect(readiness).resolves.toEqual({
+      error:
+        "staged readiness exceeded its 25ms phase deadline; uploaded build was not stable for 1 consecutive probe(s)",
+      ready: false,
+    });
+    // The exact count depends on response/cancellation overhead inside this
+    // real wall-clock window. Prove that the phase retried but stopped on its
+    // own deadline instead of exhausting the configured attempt ceiling.
+    expect(fetchImpl.mock.calls.length).toBeGreaterThan(1);
+    expect(fetchImpl.mock.calls.length).toBeLessThan(100);
+  });
+
+  it("keeps failed readiness bounded by the default phase deadline", async () => {
+    let now = 0;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const fetchImpl = vi.fn(async () => {
+      now += 10_000;
+      throw new DOMException("timed out", "AbortError");
+    });
+
+    try {
+      const readiness = await waitForCdnWarmTargetReadiness({
+        expectedBuildId: "build-a",
+        fetchImpl: fetchImpl as typeof fetch,
+        plan: { loadingShellPaths: [], pagesDataPaths: [], paths: ["/"], rscPaths: [] },
+        probeIntervalMs: 0,
+        requiredConsecutiveSuccesses: 6,
+        retries: 60,
+        targetUrl: "https://app.example.com",
+        timeoutMs: 10_000,
+      });
+
+      expect(readiness.ready).toBe(false);
+      expect(fetchImpl).toHaveBeenCalledTimes(12);
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 
   it("does not skip a non-success response from a different build", async () => {
@@ -719,7 +1151,7 @@ describe("Cloudflare CDN warmup", () => {
     ).rejects.toThrow("response is missing CF-Cache-Status");
   });
 
-  it("rejects HTML variants that the warmer request cannot share with browsers", async () => {
+  it("accepts HTML responses with custom Vary fields", async () => {
     const fetchImpl = vi.fn(async () => {
       const response = cacheableHtml();
       response.headers.set("vary", `${VINEXT_RSC_VARY_HEADER}, User-Agent`);
@@ -734,7 +1166,7 @@ describe("Cloudflare CDN warmup", () => {
         strict: true,
         targetUrl: "https://app.example.com",
       }),
-    ).rejects.toThrow("response Vary has unsupported field user-agent");
+    ).resolves.toMatchObject({ warmed: 1, skipped: 0, failed: 0 });
   });
 
   it("accepts HTML varied only by framework RSC selector headers", async () => {
@@ -825,7 +1257,7 @@ describe("Cloudflare CDN warmup", () => {
   it("does not retry permanent validation failures from the uploaded build", async () => {
     const fetchImpl = vi.fn(async () => {
       const response = cacheableRsc();
-      response.headers.set("vary", `${VINEXT_RSC_VARY_HEADER}, User-Agent`);
+      response.headers.set("vary", "User-Agent");
       return response;
     });
 
@@ -842,7 +1274,7 @@ describe("Cloudflare CDN warmup", () => {
         strict: true,
         targetUrl: "https://app.example.com",
       }),
-    ).rejects.toThrow("response Vary has unsupported field user-agent");
+    ).rejects.toThrow("response Vary is missing rsc");
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
@@ -917,7 +1349,7 @@ describe("Cloudflare CDN warmup", () => {
     expect(calls.lastIndexOf("/later:html")).toBeGreaterThan(lastInitialRequest);
   });
 
-  it("does not expire propagation retries while requests wait in the queue", async () => {
+  it("bounds queued targets and retry delays by one propagation phase deadline", async () => {
     let now = 0;
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const attempts = new Map<string, number>();
@@ -928,12 +1360,10 @@ describe("Cloudflare CDN warmup", () => {
       const attempt = (attempts.get(key) ?? 0) + 1;
       attempts.set(key, attempt);
 
-      // Move beyond the former 30-second wall-clock deadline before the
-      // concurrency-1 worker can dequeue any of the remaining requests.
+      // Exhaust the shared phase before the retry or any queued request can run.
       if (key === "/first:rsc") {
         now = 31_000;
-      } else if (url.pathname === "/later" && attempt === 1) {
-        return new Response("not propagated", { status: isRsc ? 404 : 500 });
+        return new Response("not propagated", { status: 404 });
       }
       return isRsc ? cacheableRsc() : cacheableHtml();
     });
@@ -943,16 +1373,42 @@ describe("Cloudflare CDN warmup", () => {
         concurrency: 1,
         expectedRscBuildId: "rsc-build-a",
         fetchImpl: fetchImpl as typeof fetch,
+        phaseTimeoutMs: 30_000,
         paths: ["/first", "/later"],
         propagatingTarget: true,
-        retryDelayMs: 0,
+        retries: 2,
+        retryDelayMs: 1_000,
         rscPaths: ["/first", "/later"],
         strict: true,
         targetUrl: "https://app.example.com",
       }),
-    ).resolves.toMatchObject({ total: 4, warmed: 4, failed: 0 });
-    expect(attempts.get("/later:rsc")).toBe(2);
-    expect(attempts.get("/later:html")).toBe(2);
+    ).rejects.toThrow("CDN warmup exceeded its 30000ms phase deadline");
+    expect(attempts).toEqual(new Map([["/first:rsc", 1]]));
+  });
+
+  it("uses the remaining phase budget as the fetch deadline", async () => {
+    const fetchImpl = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) =>
+        await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError")),
+          );
+        }),
+    );
+
+    await expect(
+      warmCdnCache({
+        fetchImpl: fetchImpl as typeof fetch,
+        phaseTimeoutMs: 5,
+        paths: ["/stalled"],
+        propagatingTarget: true,
+        retries: 2,
+        strict: true,
+        targetUrl: "https://app.example.com",
+        timeoutMs: 1_000,
+      }),
+    ).rejects.toThrow("CDN warmup exceeded its 5ms phase deadline");
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
 
   it("keeps the staged propagation budget independent for each failed key", async () => {

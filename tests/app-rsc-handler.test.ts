@@ -38,6 +38,11 @@ import {
   headers as requestHeaders,
 } from "../packages/vinext/src/shims/headers.js";
 import { readStaticFileSignal } from "../packages/vinext/src/server/static-file-signal.js";
+import { runWithExecutionContext } from "../packages/vinext/src/shims/request-context.js";
+import {
+  CACHEABILITY_REQUEST_STATE,
+  type RouteCacheabilityState,
+} from "../packages/vinext/src/shims/cacheability-classification.js";
 
 type TestRoute = {
   __loadPage?: unknown;
@@ -203,6 +208,74 @@ describe("createAppRscHandler", () => {
     expect(await response.text()).toBe("page");
   });
 
+  it.each([
+    {
+      condition: { type: "cookie" as const, key: "tenant" },
+      expectedReason: "next.config rewrite depends on request headers, cookies, or hostnames",
+      expectedStatus: 200,
+      requestUrl: "https://example.test/docs/account",
+      requestHeaders: { Cookie: "tenant=alice" },
+    },
+    {
+      condition: { type: "cookie" as const, key: "tenant" },
+      expectedReason: "next.config rewrite depends on request headers, cookies, or hostnames",
+      expectedStatus: 404,
+      requestUrl: "https://example.test/docs/account",
+      requestHeaders: undefined,
+    },
+    {
+      condition: { type: "host" as const, key: "host", value: "example\\.test" },
+      expectedReason: "next.config rewrite depends on request headers, cookies, or hostnames",
+      expectedStatus: 200,
+      requestUrl: "https://example.test/docs/account",
+      requestHeaders: undefined,
+    },
+    {
+      condition: { type: "query" as const, key: "tenant" },
+      expectedReason: undefined,
+      expectedStatus: 200,
+      requestUrl: "https://example.test/docs/account?tenant=alice",
+      requestHeaders: undefined,
+    },
+  ])(
+    "keeps $condition.type-conditioned rewrite cacheability aligned with the public key",
+    async ({ condition, expectedReason, expectedStatus, requestHeaders, requestUrl }) => {
+      // Cookie-conditioned rewrites are exercised by Next.js here:
+      // test/e2e/custom-routes/custom-routes.test.ts
+      // https://github.com/vercel/next.js/blob/canary/test/e2e/custom-routes/custom-routes.test.ts
+      const handler = createHandler({
+        configHeaders: [],
+        configRewrites: {
+          beforeFiles: [
+            {
+              source: "/account",
+              destination: "/about",
+              has: [condition],
+            },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+      });
+      const state: RouteCacheabilityState = {
+        captureDeadlineAt: Date.now() + 1_000,
+        mode: "admit",
+      };
+      const context = {
+        [CACHEABILITY_REQUEST_STATE]: state,
+        waitUntil() {},
+      };
+
+      const response = await runWithExecutionContext(context, () =>
+        handler(new Request(requestUrl, { headers: requestHeaders }), null),
+      );
+
+      expect(response.status).toBe(expectedStatus);
+      if (expectedStatus === 200) expect(await response.text()).toBe("page");
+      expect(state.forcedDynamicReason).toBe(expectedReason);
+    },
+  );
+
   it.each(["afterFiles", "fallback"] as const)(
     "allows out-of-basePath %s rewrites to reach Pages routes",
     async (phase) => {
@@ -233,6 +306,97 @@ describe("createAppRscHandler", () => {
       );
     },
   );
+
+  it.each([
+    {
+      condition: { type: "cookie" as const, key: "tenant" },
+      expectedReason: "next.config headers depend on request headers, cookies, or hostnames",
+      expectedHeader: "alice",
+      requestUrl: "https://example.test/docs/about",
+      requestHeaders: { Cookie: "tenant=alice" },
+    },
+    {
+      condition: { type: "cookie" as const, key: "tenant" },
+      expectedReason: "next.config headers depend on request headers, cookies, or hostnames",
+      expectedHeader: null,
+      requestUrl: "https://example.test/docs/about",
+      requestHeaders: undefined,
+    },
+    {
+      condition: { type: "host" as const, key: "host", value: "example\\.test" },
+      expectedReason: "next.config headers depend on request headers, cookies, or hostnames",
+      expectedHeader: "alice",
+      requestUrl: "https://example.test/docs/about",
+      requestHeaders: undefined,
+    },
+    {
+      condition: { type: "query" as const, key: "tenant" },
+      expectedReason: undefined,
+      expectedHeader: "alice",
+      requestUrl: "https://example.test/docs/about?tenant=alice",
+      requestHeaders: undefined,
+    },
+  ])(
+    "keeps $condition.type-conditioned config header cacheability aligned with the public key",
+    async ({ condition, expectedHeader, expectedReason, requestHeaders, requestUrl }) => {
+      const handler = createHandler({
+        configHeaders: [
+          {
+            source: "/about",
+            has: [condition],
+            headers: [{ key: "X-Tenant", value: "alice" }],
+          },
+        ],
+      });
+      const state: RouteCacheabilityState = {
+        captureDeadlineAt: Date.now() + 1_000,
+        mode: "admit",
+      };
+      const context = {
+        [CACHEABILITY_REQUEST_STATE]: state,
+        waitUntil() {},
+      };
+
+      const response = await runWithExecutionContext(context, () =>
+        handler(new Request(requestUrl, { headers: requestHeaders }), null),
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("X-Tenant")).toBe(expectedHeader);
+      expect(state.forcedDynamicReason).toBe(expectedReason);
+    },
+  );
+
+  it("keeps a condition-miss redirect pathname private", async () => {
+    const handler = createHandler({
+      configRedirects: [
+        {
+          source: "/about",
+          destination: "/account",
+          permanent: false,
+          has: [{ type: "cookie", key: "tenant" }],
+        },
+      ],
+    });
+    const state: RouteCacheabilityState = {
+      captureDeadlineAt: Date.now() + 1_000,
+      mode: "admit",
+    };
+    const context = {
+      [CACHEABILITY_REQUEST_STATE]: state,
+      waitUntil() {},
+    };
+
+    const response = await runWithExecutionContext(context, () =>
+      handler(new Request("https://example.test/docs/about"), null),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("page");
+    expect(state.forcedDynamicReason).toBe(
+      "next.config redirect depends on request headers, cookies, or hostnames",
+    );
+  });
 
   it("passes source config headers into Server Action execution", async () => {
     let sourceConfigHeader: string | null | undefined;
@@ -690,8 +854,8 @@ describe("createAppRscHandler", () => {
       async runMiddleware({ cleanPathname }) {
         middlewarePaths.push(cleanPathname);
         return cleanPathname.startsWith("/feed/secret")
-          ? { kind: "response", response: new Response("denied", { status: 401 }) }
-          : { kind: "continue", cleanPathname, rewritten: false, search: null };
+          ? { kind: "response", matched: true, response: new Response("denied", { status: 401 }) }
+          : { kind: "continue", cleanPathname, matched: true, rewritten: false, search: null };
       },
     });
 
@@ -1918,7 +2082,7 @@ describe("createAppRscHandler", () => {
         } else {
           getHeadersContext()?.headers.set("x-source", "added");
         }
-        return { kind: "continue", cleanPathname, rewritten: false, search: null };
+        return { kind: "continue", cleanPathname, matched: true, rewritten: false, search: null };
       },
     });
 
@@ -2043,7 +2207,7 @@ describe("createAppRscHandler", () => {
         pathname === "/photos/1" ? { params: {}, route: targetRoute } : null,
       async runMiddleware({ cleanPathname }) {
         middlewarePaths.push(cleanPathname);
-        return { kind: "continue", cleanPathname, rewritten: false, search: null };
+        return { kind: "continue", cleanPathname, matched: true, rewritten: false, search: null };
       },
     });
 
@@ -4455,7 +4619,7 @@ describe("createAppRscHandler", () => {
         matchRoute,
         async runMiddleware({ cleanPathname }) {
           middlewarePaths.push(cleanPathname);
-          return { kind: "continue", cleanPathname, rewritten: false, search: null };
+          return { kind: "continue", cleanPathname, matched: true, rewritten: false, search: null };
         },
       });
       const headers = createRscRequestHeaders({ interceptionContext: "/feed" });
@@ -4496,9 +4660,20 @@ describe("createAppRscHandler", () => {
       renderPagesFallback,
     });
 
-    const response = await handler(new Request("https://example.test/docs/about"), null);
+    const state: RouteCacheabilityState = {
+      captureDeadlineAt: Date.now() + 1_000,
+      mode: "admit",
+    };
+    const context = {
+      [CACHEABILITY_REQUEST_STATE]: state,
+      waitUntil() {},
+    };
+    const response = await runWithExecutionContext(context, () =>
+      handler(new Request("https://example.test/docs/about"), null),
+    );
 
     expect(await response.text()).toBe("pages:/about");
+    expect(state.preserveResponseCachePolicy).toBe(true);
     expect(renderPagesFallback).toHaveBeenCalledWith(
       expect.objectContaining({
         matchKind: "static",

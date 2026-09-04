@@ -269,6 +269,9 @@ importers:
       '@mswjs/interceptors':
         specifier: 'catalog:'
         version: 0.41.9
+      '@oxlint/plugins':
+        specifier: 1.81.0
+        version: 1.81.0
       '@playwright/test':
         specifier: 'catalog:'
         version: 1.60.0
@@ -3819,6 +3822,10 @@ packages:
 
   '@oxlint/plugins@1.73.0':
     resolution: {integrity: sha512-OhgMQeMmZA0dcFcX4/priaJZWdFECxiClgq6mRX6aatZEcV9PbKC3P3/v8U1hVjviT1i5U+vR8lAtBV6m4FXAA==}
+    engines: {node: ^12.22.0 || ^14.17.0 || >=16.0.0}
+
+  '@oxlint/plugins@1.81.0':
+    resolution: {integrity: sha512-HhD8kd3r6XpelZkhxhRty/po8V6yK1VV63Eq4kSsOS2IoHUywG3DV2EX+z/ZHw46aLI74Y6aA604NRiAqLKW9w==}
     engines: {node: ^12.22.0 || ^14.17.0 || >=16.0.0}
 
   '@parcel/watcher-android-arm64@2.5.6':
@@ -10045,6 +10052,8 @@ snapshots:
     optional: true
 
   '@oxlint/plugins@1.73.0': {}
+
+  '@oxlint/plugins@1.81.0': {}
 
   '@parcel/watcher-android-arm64@2.5.6':
     optional: true

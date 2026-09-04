@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import { executeMiddleware } from "../packages/vinext/src/server/middleware-runtime.js";
+import {
+  executeMiddleware,
+  runGeneratedMiddleware,
+} from "../packages/vinext/src/server/middleware-runtime.js";
 import type { NextRequest } from "../packages/vinext/src/shims/server.js";
 
 describe("middleware pathname matching", () => {
@@ -431,6 +434,99 @@ describe("middleware redirect protocol", () => {
     });
 
     expect((capturedRequest as NextRequest & { __isData?: boolean }).__isData).toBeUndefined();
+  });
+
+  it("reports whether the configured matcher accepted the request", async () => {
+    const onMatch = vi.fn();
+    const module = {
+      config: { matcher: "/matched/:path*" },
+      default: () => undefined,
+    };
+
+    await executeMiddleware({
+      isProxy: false,
+      module,
+      onMatch,
+      request: new Request("http://localhost:3000/not-matched"),
+    });
+    expect(onMatch).not.toHaveBeenCalled();
+
+    await executeMiddleware({
+      isProxy: false,
+      module,
+      onMatch,
+      request: new Request("http://localhost:3000/matched/page"),
+    });
+    expect(onMatch).toHaveBeenCalledOnce();
+  });
+
+  it("reports pathname eligibility before request matcher conditions", async () => {
+    const onMatch = vi.fn();
+    const onPathMatch = vi.fn();
+    const module = {
+      config: {
+        matcher: [
+          {
+            source: "/conditional/:path*",
+            has: [{ type: "cookie", key: "middleware-user" }],
+          },
+        ],
+      },
+      default: () => undefined,
+    };
+
+    await executeMiddleware({
+      isProxy: false,
+      module,
+      onMatch,
+      onPathMatch,
+      request: new Request("http://localhost:3000/not-conditional"),
+    });
+    expect(onPathMatch).not.toHaveBeenCalled();
+    expect(onMatch).not.toHaveBeenCalled();
+
+    await executeMiddleware({
+      isProxy: false,
+      module,
+      onMatch,
+      onPathMatch,
+      request: new Request("http://localhost:3000/conditional/page"),
+    });
+    expect(onPathMatch).toHaveBeenCalledOnce();
+    expect(onMatch).not.toHaveBeenCalled();
+
+    await executeMiddleware({
+      isProxy: false,
+      module,
+      onMatch,
+      onPathMatch,
+      request: new Request("http://localhost:3000/conditional/page", {
+        headers: { Cookie: "middleware-user=1" },
+      }),
+    });
+    expect(onPathMatch).toHaveBeenCalledTimes(2);
+    expect(onMatch).toHaveBeenCalledOnce();
+  });
+
+  it("returns pathname eligibility from the generated middleware boundary", async () => {
+    const result = await runGeneratedMiddleware({
+      isProxy: false,
+      module: {
+        config: {
+          matcher: [
+            {
+              source: "/conditional/:path*",
+              has: [{ type: "header", key: "x-middleware-user" }],
+            },
+          ],
+        },
+        default: () => undefined,
+      },
+      request: new Request("http://localhost:3000/conditional/page"),
+    });
+
+    expect(result.continue).toBe(true);
+    expect(result.pathnameEligible).toBe(true);
   });
 
   it("relativizes the Location header for same-host redirects", async () => {

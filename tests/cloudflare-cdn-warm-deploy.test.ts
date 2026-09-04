@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { Buffer } from "node:buffer";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +9,16 @@ import {
 } from "../packages/vinext/src/server/app-rsc-cache-busting.js";
 import { VINEXT_CDN_BUILD_ID_HEADER } from "../packages/cloudflare/src/cache/cdn-build-id.js";
 import { VINEXT_EXPECTED_WORKER_VERSION_HEADER } from "../packages/cloudflare/src/version-headers.js";
+import { writeCacheabilityManifestArtifact } from "../packages/cloudflare/src/cacheability-artifact.js";
+import {
+  CACHEABILITY_MANIFEST_MODULE,
+  cacheabilityManifestRouteKey,
+  type CacheabilityManifest,
+} from "../packages/vinext/src/server/cacheability-manifest.js";
+import {
+  VINEXT_CACHEABILITY_PROBE_HEADER,
+  VINEXT_PRERENDER_READINESS_HEADER,
+} from "../packages/vinext/src/server/headers.js";
 
 const execFileSyncMock = vi.hoisted(() => vi.fn());
 const delayMock = vi.hoisted(() => vi.fn());
@@ -50,11 +61,32 @@ function getRealWarmFetchCalls() {
   return vi.mocked(fetch).mock.calls.filter(([url]) => !isReadinessFetch(url));
 }
 
-function cacheableHtml(body = "ok"): Response {
+function cacheableHtml(body = "ok", cacheStatus = "MISS"): Response {
   return new Response(body, {
     headers: {
-      "cf-cache-status": "MISS",
+      "cf-cache-status": cacheStatus,
       "content-type": "text/html",
+      [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a",
+    },
+  });
+}
+
+function readinessResponse(buildId = "app-build-a"): Response {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "cache-control": "no-store",
+      [VINEXT_CDN_BUILD_ID_HEADER]: buildId,
+      [VINEXT_PRERENDER_READINESS_HEADER]: "1",
+    },
+  });
+}
+
+function cacheablePagesData(cacheStatus = "MISS"): Response {
+  return new Response('{"pageProps":{}}', {
+    headers: {
+      "cf-cache-status": cacheStatus,
+      "content-type": "application/json",
       [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a",
     },
   });
@@ -67,10 +99,159 @@ function cacheableRsc(body = "flight"): Response {
       "cdn-cache-control": "public, max-age=60",
       "cf-cache-status": "MISS",
       "content-type": "text/x-component",
+      [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a",
       [VINEXT_RSC_BUILD_ID_HEADER]: "app-build-a",
       vary: VINEXT_RSC_VARY_HEADER,
     },
   });
+}
+
+const OLD_VERSION = "11111111-1111-4111-8111-111111111111";
+const PROBE_VERSION = "22222222-2222-4222-8222-222222222222";
+const FINAL_VERSION = "33333333-3333-4333-8333-333333333333";
+
+function writeTwoStageWorkerArtifact(): void {
+  writeFile(
+    "dist/server/wrangler.json",
+    JSON.stringify({ main: "index.js", name: "my-worker", workers_dev: true }),
+  );
+  writeFile("dist/server/index.js", `import "./${CACHEABILITY_MANIFEST_MODULE}";\n`);
+  writeFile(`dist/server/${CACHEABILITY_MANIFEST_MODULE}`, "export default null;\n");
+  writeFile(
+    "dist/server/vinext-server.json",
+    JSON.stringify({ prerenderSecret: "test-prerender-secret" }),
+  );
+}
+
+function appPageProbeResponse(
+  state: "static-candidate" | "probe-failed" = "static-candidate",
+  pattern = "/about",
+) {
+  return Response.json(
+    {
+      kind: "app-page",
+      pattern,
+      ...(state === "probe-failed" ? { reason: "render classification failed" } : {}),
+      ...(state === "static-candidate" ? { rendererStatic: true } : {}),
+      state,
+      status: 200,
+      version: 1,
+    },
+    {
+      headers: {
+        "Cache-Control": "no-store",
+        [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a",
+      },
+    },
+  );
+}
+
+function appPageRoutePatterns(paths: readonly string[], pattern = "/about") {
+  return Object.fromEntries(
+    paths.map((pathname) => [
+      pathname,
+      {
+        cacheabilityProbe: { canPrunePattern: true },
+        kind: "app-page" as const,
+        pattern,
+      },
+    ]),
+  );
+}
+
+function mockTwoStageWrangler(
+  options: {
+    failFinalUpload?: boolean;
+    replaceFinalStageBeforeHandoff?: "identity" | "traffic";
+  } = {},
+) {
+  const state = {
+    finalManifestSource: null as string | null,
+    finalStaged: false,
+    promoted: false,
+    statusCount: 0,
+    triggerDeploys: 0,
+    uploads: 0,
+  };
+  execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+    if (args.includes("upload")) {
+      state.uploads++;
+      if (state.uploads === 2 && options.failFinalUpload) throw new Error("final upload failed");
+      if (state.uploads === 2) {
+        const configPath = path.resolve(tmpDir, args[args.indexOf("--config") + 1]!);
+        state.finalManifestSource = fs.readFileSync(
+          path.join(path.dirname(configPath), CACHEABILITY_MANIFEST_MODULE),
+          "utf8",
+        );
+      }
+      return `Uploaded my-worker\nWorker Version ID: ${state.uploads === 1 ? PROBE_VERSION : FINAL_VERSION}\n`;
+    }
+    if (args.includes("status")) {
+      state.statusCount++;
+      const replaceFinalStage =
+        state.finalStaged && state.statusCount >= 6 && options.replaceFinalStageBeforeHandoff;
+      return JSON.stringify({
+        id:
+          state.statusCount === 1
+            ? "initial-deployment"
+            : replaceFinalStage
+              ? "replacement-deployment"
+              : state.finalStaged
+                ? "final-stage-deployment"
+                : "probe-stage-deployment",
+        versions:
+          state.statusCount === 1
+            ? [{ version_id: OLD_VERSION, percentage: 100 }]
+            : replaceFinalStage === "traffic"
+              ? [{ version_id: "44444444-4444-4444-8444-444444444444", percentage: 100 }]
+              : state.finalStaged
+                ? [
+                    { version_id: OLD_VERSION, percentage: 100 },
+                    { version_id: FINAL_VERSION, percentage: 0 },
+                  ]
+                : [
+                    { version_id: OLD_VERSION, percentage: 100 },
+                    { version_id: PROBE_VERSION, percentage: 0 },
+                  ],
+      });
+    }
+    if (args.includes(`${PROBE_VERSION}@0%`)) {
+      return "Staged version\nhttps://my-worker.example.workers.dev\n";
+    }
+    if (args.includes(`${FINAL_VERSION}@0%`)) {
+      state.finalStaged = true;
+      return "Staged version\nhttps://my-worker.example.workers.dev\n";
+    }
+    if (args.includes(`${FINAL_VERSION}@100%`)) {
+      state.promoted = true;
+      return "Promoted version\nhttps://my-worker.example.workers.dev\n";
+    }
+    if (args.includes("triggers")) {
+      state.triggerDeploys++;
+      return "Triggers deployed\nhttps://my-worker.example.workers.dev\n";
+    }
+    throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+  });
+  return state;
+}
+
+function pagesPageProbeResponse() {
+  return Response.json(
+    {
+      kind: "pages-page",
+      pattern: "/pages-about",
+      rendererStatic: true,
+      state: "static-candidate",
+      status: 200,
+      version: 1,
+    },
+    {
+      headers: {
+        "Cache-Control": "no-store",
+        [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a",
+      },
+    },
+  );
 }
 
 describe("Cloudflare CDN warmup deploy flow", () => {
@@ -98,6 +279,14 @@ describe("Cloudflare CDN warmup deploy flow", () => {
     expect(hasCdnWarmRequests({ loadingShellPaths: ["/dashboard"], paths: [], rscPaths: [] })).toBe(
       true,
     );
+    expect(
+      hasCdnWarmRequests({
+        loadingShellPaths: [],
+        paths: [],
+        routeHandlerPaths: ["/api/data"],
+        rscPaths: [],
+      }),
+    ).toBe(true);
     expect(hasCdnWarmRequests({ loadingShellPaths: [], paths: [], rscPaths: [] })).toBe(false);
   });
 
@@ -110,6 +299,1458 @@ describe("Cloudflare CDN warmup deploy flow", () => {
       '--warm-cdn-promotion-delay must not exceed 2147483647 milliseconds, but got "2147483648".',
     );
     expect(execFileSyncMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a generated artifact whose Worker main cannot reach the manifest module", () => {
+    writeTwoStageWorkerArtifact();
+    writeFile("dist/server/index.js", "export default { fetch() {} };\n");
+
+    expect(() =>
+      writeCacheabilityManifestArtifact(tmpDir, "dist/server/wrangler.json", {
+        buildId: "build-a",
+        routes: {},
+        version: 1,
+      }),
+    ).toThrow(`Worker main module to import ${CACHEABILITY_MANIFEST_MODULE}`);
+  });
+
+  it.each([
+    ["comment", `// import "./${CACHEABILITY_MANIFEST_MODULE}";\nexport default {};\n`],
+    [
+      "string",
+      `const marker = 'import "./${CACHEABILITY_MANIFEST_MODULE}"';\nexport default {};\n`,
+    ],
+    [
+      "template",
+      `const marker = \`import "./${CACHEABILITY_MANIFEST_MODULE}"\`;\nexport default {};\n`,
+    ],
+    [
+      "regular expression",
+      `/import "\\.\\/${CACHEABILITY_MANIFEST_MODULE}"/;\nexport default {};\n`,
+    ],
+    ["dynamic import", `void import("./${CACHEABILITY_MANIFEST_MODULE}");\nexport default {};\n`],
+    [
+      "longer specifier",
+      `import "./${CACHEABILITY_MANIFEST_MODULE}.backup";\nexport default {};\n`,
+    ],
+  ])("rejects a manifest filename mentioned only by a %s", (_label, mainSource) => {
+    writeTwoStageWorkerArtifact();
+    writeFile("dist/server/index.js", mainSource);
+
+    expect(() =>
+      writeCacheabilityManifestArtifact(tmpDir, "dist/server/wrangler.json", {
+        buildId: "build-a",
+        routes: {},
+        version: 1,
+      }),
+    ).toThrow(`Worker main module to import ${CACHEABILITY_MANIFEST_MODULE}`);
+  });
+
+  it.each([
+    [
+      "static import",
+      `import manifest from "./${CACHEABILITY_MANIFEST_MODULE}";\nexport default manifest;\n`,
+    ],
+    [
+      "static re-export",
+      `export { default as manifest } from "./${CACHEABILITY_MANIFEST_MODULE}";\n`,
+    ],
+  ])("accepts a manifest reached by a %s", (_label, mainSource) => {
+    writeTwoStageWorkerArtifact();
+    writeFile("dist/server/index.js", mainSource);
+
+    expect(
+      writeCacheabilityManifestArtifact(tmpDir, "dist/server/wrangler.json", {
+        buildId: "build-a",
+        routes: {},
+        version: 1,
+      }),
+    ).toBe("dist/server/wrangler.json");
+    expect(
+      fs.readFileSync(path.join(tmpDir, "dist/server", CACHEABILITY_MANIFEST_MODULE), "utf8"),
+    ).toBe('export default "{\\"buildId\\":\\"build-a\\",\\"routes\\":{},\\"version\\":1}";\n');
+  });
+
+  it("accepts a manifest over one MiB with more than 10,000 route patterns", () => {
+    writeTwoStageWorkerArtifact();
+    const routes = Object.fromEntries(
+      Array.from({ length: 10_001 }, (_, index) => {
+        const pattern = `/route-${index}-${"x".repeat(30)}`;
+        return [
+          cacheabilityManifestRouteKey("app-page", pattern),
+          { kind: "app-page" as const, pattern, state: "runtime-check" as const },
+        ];
+      }),
+    );
+    const manifest: CacheabilityManifest = { buildId: "build-a", routes, version: 1 };
+    const manifestBytes = Buffer.byteLength(JSON.stringify(manifest));
+    expect(manifestBytes).toBeGreaterThan(1024 * 1024);
+    expect(manifestBytes).toBeLessThan(2 * 1024 * 1024);
+
+    expect(() =>
+      writeCacheabilityManifestArtifact(tmpDir, "dist/server/wrangler.json", manifest),
+    ).not.toThrow();
+  });
+
+  it("warms concrete static paths while tolerating a private paired representation", async () => {
+    writeTwoStageWorkerArtifact();
+    const log = vi.spyOn(console, "log");
+    const events: string[] = [];
+    let uploadCount = 0;
+    let statusCount = 0;
+    let finalStaged = false;
+    const cacheRequestCounts = new Map<string, number>();
+    let finalManifestSource = "";
+    let finalConfig: unknown;
+
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) {
+        uploadCount++;
+        if (uploadCount === 2) {
+          const configPath = path.resolve(tmpDir, args[args.indexOf("--config") + 1]!);
+          finalConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+          finalManifestSource = fs.readFileSync(
+            path.join(path.dirname(configPath), CACHEABILITY_MANIFEST_MODULE),
+            "utf8",
+          );
+          events.push("upload-final");
+          return `Uploaded my-worker\nWorker Version ID: ${FINAL_VERSION}\n`;
+        }
+        events.push("upload-probe");
+        return `Uploaded my-worker\nWorker Version ID: ${PROBE_VERSION}\n`;
+      }
+      if (args.includes("status")) {
+        statusCount++;
+        events.push(`status-${statusCount}`);
+        return JSON.stringify({
+          versions:
+            statusCount === 1
+              ? [{ version_id: OLD_VERSION, percentage: 100 }]
+              : finalStaged
+                ? [
+                    { version_id: OLD_VERSION, percentage: 100 },
+                    { version_id: FINAL_VERSION, percentage: 0 },
+                  ]
+                : [
+                    { version_id: OLD_VERSION, percentage: 100 },
+                    { version_id: PROBE_VERSION, percentage: 0 },
+                  ],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) {
+        events.push("stage-probe");
+        return "Staged probe version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes(`${FINAL_VERSION}@0%`)) {
+        finalStaged = true;
+        events.push("stage-final");
+        return "Staged final version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes(`${FINAL_VERSION}@100%`)) {
+        events.push("promote-final");
+        return "Promoted final version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes("triggers")) {
+        events.push("triggers");
+        return "Triggers deployed\nhttps://my-worker.example.workers.dev\n";
+      }
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const headers = new Headers(init?.headers);
+      if (headers.get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1") {
+        const pathname = new URL(formatFetchUrl(input)).pathname;
+        const isRsc = headers.get("RSC") === "1";
+        events.push(`probe:${pathname}${isRsc ? ":rsc" : ""}`);
+        if (
+          pathname === "/pages-about" ||
+          pathname === "/_next/data/app-build-a/pages-about.json"
+        ) {
+          return pagesPageProbeResponse();
+        }
+        if (pathname === "/dynamic") {
+          return Response.json(
+            {
+              kind: "app-page",
+              pattern: "/:slug",
+              scope: "identity",
+              state: "dynamic",
+              status: 200,
+              version: 1,
+            },
+            { headers: { [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a" } },
+          );
+        }
+        if (pathname === "/api/data") {
+          return Response.json(
+            {
+              kind: "app-route",
+              pattern: "/api/data",
+              state: "static-candidate",
+              status: 200,
+              version: 1,
+            },
+            { headers: { [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a" } },
+          );
+        }
+        return appPageProbeResponse("static-candidate", "/:slug");
+      }
+      if (isReadinessFetch(input)) events.push("readiness");
+      else {
+        const pathname = new URL(formatFetchUrl(input)).pathname;
+        const isRsc = headers.get("RSC") === "1";
+        const cacheKey = `${pathname}${isRsc ? "?_rsc" : ""}`;
+        const count = (cacheRequestCounts.get(cacheKey) ?? 0) + 1;
+        cacheRequestCounts.set(cacheKey, count);
+        events.push(`${count === 1 ? "warm" : "unexpected-second-request"}:${cacheKey}`);
+      }
+      const pathname = new URL(formatFetchUrl(input)).pathname;
+      const isRsc = headers.get("RSC") === "1";
+      if (isReadinessFetch(input)) {
+        expect(pathname).toBe("/__vinext/prerender/readiness");
+        expect(init?.method).toBe("POST");
+        expect(headers.get("accept")).toBe("text/html");
+        expect(headers.get("rsc")).toBeNull();
+        expect(headers.get("x-vinext-prerender-secret")).toBe("test-prerender-secret");
+        return readinessResponse();
+      }
+      const cacheKey = `${pathname}${isRsc ? "?_rsc" : ""}`;
+      const cacheStatus = (cacheRequestCounts.get(cacheKey) ?? 0) > 1 ? "HIT" : "MISS";
+      if (pathname === "/about" && isRsc) {
+        return new Response("private paired rsc", {
+          headers: {
+            "Cache-Control": "no-store",
+            "CF-Cache-Status": "BYPASS",
+            "Content-Type": "text/x-component",
+            [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a",
+          },
+        });
+      }
+      if (pathname === "/dynamic") {
+        return new Response(isRsc ? "dynamic rsc" : "dynamic html", {
+          headers: {
+            "Cache-Control": "no-store",
+            "CF-Cache-Status": "BYPASS",
+            "Content-Type": isRsc ? "text/x-component" : "text/html",
+            [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a",
+          },
+        });
+      }
+      return isRsc
+        ? cacheableRsc()
+        : pathname.startsWith("/_next/data/")
+          ? cacheablePagesData(cacheStatus)
+          : cacheableHtml("ok", cacheStatus);
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    const deployedUrl = await deployWithCdnWarmup(tmpDir, [], {
+      cacheabilityProbe: true,
+      config: "dist/server/wrangler.json",
+      discoverWarmPlan: async () => ({
+        appPaths: ["/about", "/dynamic"],
+        buildId: "app-build-a",
+        buildIdentity: "app-build-a",
+        loadingShellPaths: [],
+        pagesDataPaths: ["/_next/data/app-build-a/pages-about.json"],
+        pagesPaths: ["/pages-about"],
+        paths: ["/about", "/dynamic", "/pages-about"],
+        routeHandlerPaths: ["/api/data"],
+        routePatterns: {
+          "/about": {
+            cacheabilityProbe: { canPrunePattern: true },
+            kind: "app-page",
+            pattern: "/:slug",
+          },
+          "/api/data": {
+            cacheabilityProbe: { canPrunePattern: true },
+            kind: "app-route",
+            pattern: "/api/data",
+          },
+          "/dynamic": {
+            cacheabilityProbe: { canPrunePattern: true },
+            kind: "app-page",
+            pattern: "/:slug",
+          },
+          "/pages-about": {
+            cacheabilityProbe: { canPrunePattern: true },
+            kind: "pages-page",
+            pattern: "/pages-about",
+          },
+          "/_next/data/app-build-a/pages-about.json": {
+            cacheabilityProbe: { canPrunePattern: true },
+            kind: "pages-page",
+            pattern: "/pages-about",
+          },
+        },
+        rscPaths: ["/about", "/dynamic"],
+      }),
+      warmCdnConcurrency: 1,
+      warmCdnPromotionDelay: 0,
+      warmCdnReadinessProbes: 1,
+      warmCdnRetries: 0,
+    });
+
+    expect(deployedUrl).toBe("https://my-worker.example.workers.dev");
+    expect(uploadCount).toBe(2);
+    expect(statusCount).toBe(6);
+    expect(Array.from(cacheRequestCounts.entries())).toEqual([
+      ["/about?_rsc", 1],
+      ["/dynamic?_rsc", 1],
+      ["/_next/data/app-build-a/pages-about.json", 1],
+      ["/api/data", 1],
+      ["/about", 1],
+      ["/pages-about", 1],
+    ]);
+    expect(events).toEqual([
+      "upload-probe",
+      "status-1",
+      "stage-probe",
+      "status-2",
+      "readiness",
+      "probe:/about",
+      "probe:/pages-about",
+      "probe:/api/data",
+      // Probe one representative for every pattern before probing siblings so
+      // a pattern-wide dynamic result can prune the remaining concrete paths.
+      "probe:/dynamic",
+      "status-3",
+      "upload-final",
+      "status-4",
+      "stage-final",
+      "status-5",
+      "triggers",
+      "readiness",
+      "warm:/about?_rsc",
+      "warm:/dynamic?_rsc",
+      "warm:/_next/data/app-build-a/pages-about.json",
+      "warm:/api/data",
+      "warm:/about",
+      "warm:/pages-about",
+      "status-6",
+      "promote-final",
+    ]);
+    expect(log).toHaveBeenCalledWith("  CDN warmup plan by route:");
+    expect(log).toHaveBeenCalledWith("    /:slug         App page           2        3");
+    expect(log).toHaveBeenCalledWith("    /pages-about   Pages page        2/2        0       0");
+    expect(log).toHaveBeenCalledWith("    /api/data      Route Handler     1/1        0       0");
+    log.mockRestore();
+    expect(finalConfig).toEqual({ main: "index.js", name: "my-worker", workers_dev: true });
+    const manifestJson = JSON.parse(
+      finalManifestSource.slice("export default ".length, -2),
+    ) as string;
+    const manifest = JSON.parse(manifestJson) as {
+      buildId: string;
+      routes: Record<
+        string,
+        {
+          allowUnknown?: boolean;
+          pattern: string;
+          pathPrefix?: string;
+          runtimePaths?: string[];
+          staticRepresentation?: string;
+          staticPaths?: Record<string, string[]>;
+          state: string;
+        }
+      >;
+    };
+    expect(manifest.buildId).toBe("app-build-a");
+    expect(Object.values(manifest.routes)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "app-page",
+          pattern: "/:slug",
+          runtimePaths: ["/dynamic"],
+          staticPaths: { html: ["/about"] },
+          state: "runtime-check",
+        }),
+        expect.objectContaining({
+          kind: "app-route",
+          pattern: "/api/data",
+          state: "static-candidate",
+        }),
+        expect.objectContaining({
+          kind: "pages-page",
+          pattern: "/pages-about",
+          state: "runtime-check",
+          staticRepresentation: "html",
+        }),
+      ]),
+    );
+    expect(
+      fs.readFileSync(path.join(tmpDir, "dist/server", CACHEABILITY_MANIFEST_MODULE), "utf8"),
+    ).toBe(finalManifestSource);
+  });
+
+  it("promotes a final Worker with an empty manifest when discovery finds no identities", async () => {
+    writeTwoStageWorkerArtifact();
+    const wrangler = mockTwoStageWrangler();
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: [],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: [],
+          rscPaths: [],
+        }),
+      }),
+    ).resolves.toBe("https://my-worker.example.workers.dev");
+
+    expect(wrangler.uploads).toBe(2);
+    expect(wrangler.promoted).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+    const manifestJson = JSON.parse(
+      wrangler.finalManifestSource!.slice("export default ".length, -2),
+    ) as string;
+    expect(JSON.parse(manifestJson)).toEqual({ buildId: "app-build-a", routes: {}, version: 1 });
+  });
+
+  it("uses an explicit warm target for both stages of a cacheability-probed deploy", async () => {
+    writeTwoStageWorkerArtifact();
+    const wrangler = mockTwoStageWrangler();
+    const fetchOrigins: string[] = [];
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      fetchOrigins.push(new URL(formatFetchUrl(input)).origin);
+      const headers = new Headers(init?.headers);
+      if (headers.get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1") {
+        return appPageProbeResponse();
+      }
+      if (isReadinessFetch(input)) return readinessResponse();
+      return cacheableHtml();
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async ({ targetUrl }) => {
+          expect(targetUrl).toBe("https://app.example.com");
+          return {
+            appPaths: ["/about"],
+            buildId: "app-build-a",
+            buildIdentity: "app-build-a",
+            loadingShellPaths: [],
+            paths: ["/about"],
+            routePatterns: appPageRoutePatterns(["/about"]),
+            rscPaths: [],
+          };
+        },
+        warmCdnConcurrency: 1,
+        warmCdnPromotionDelay: 0,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+        warmCdnTarget: "https://app.example.com/",
+      }),
+    ).resolves.toBe("https://my-worker.example.workers.dev");
+
+    expect(wrangler.uploads).toBe(2);
+    expect(wrangler.promoted).toBe(true);
+    expect(fetchOrigins.length).toBeGreaterThan(0);
+    expect(new Set(fetchOrigins)).toEqual(new Set(["https://app.example.com"]));
+  });
+
+  it("promotes compact pattern-only admission for zero-path static fallbacks", async () => {
+    writeTwoStageWorkerArtifact();
+    const wrangler = mockTwoStageWrangler();
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: [],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          fallbackRoutePatterns: [
+            { kind: "app-page", pattern: "/posts/:slug" },
+            { kind: "app-route", pattern: "/api/posts/:slug" },
+            { kind: "pages-page", pattern: "/legacy/:slug" },
+          ],
+          loadingShellPaths: [],
+          paths: [],
+          rscPaths: [],
+        }),
+      }),
+    ).resolves.toBe("https://my-worker.example.workers.dev");
+
+    expect(wrangler.uploads).toBe(2);
+    expect(wrangler.promoted).toBe(true);
+    expect(fetch).not.toHaveBeenCalled();
+    const manifestJson = JSON.parse(
+      wrangler.finalManifestSource!.slice("export default ".length, -2),
+    ) as string;
+    expect(JSON.parse(manifestJson)).toEqual({
+      buildId: "app-build-a",
+      routes: {
+        '["app-page","/posts/:slug"]': {
+          kind: "app-page",
+          pattern: "/posts/:slug",
+          state: "static-candidate",
+        },
+        '["app-route","/api/posts/:slug"]': {
+          kind: "app-route",
+          pattern: "/api/posts/:slug",
+          state: "static-candidate",
+        },
+        '["pages-page","/legacy/:slug"]': {
+          kind: "pages-page",
+          pattern: "/legacy/:slug",
+          state: "static-candidate",
+        },
+      },
+      version: 1,
+    });
+  });
+
+  it("promotes an empty manifest when every discovered pattern is dynamic", async () => {
+    writeTwoStageWorkerArtifact();
+    const wrangler = mockTwoStageWrangler();
+    vi.mocked(fetch).mockImplementation(async (input, init) =>
+      new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1"
+        ? Response.json(
+            {
+              kind: "app-page",
+              pattern: "/dynamic",
+              scope: "pattern",
+              state: "dynamic",
+              status: 200,
+              version: 1,
+            },
+            { headers: { [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a" } },
+          )
+        : isReadinessFetch(input)
+          ? readinessResponse()
+          : new Response("unexpected", { status: 500 }),
+    );
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/dynamic"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/dynamic"],
+          routePatterns: appPageRoutePatterns(["/dynamic"], "/dynamic"),
+          rscPaths: [],
+        }),
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).resolves.toBe("https://my-worker.example.workers.dev");
+
+    expect(wrangler.uploads).toBe(2);
+    expect(wrangler.promoted).toBe(true);
+    expect(getRealWarmFetchCalls()).toHaveLength(1);
+    const manifestJson = JSON.parse(
+      wrangler.finalManifestSource!.slice("export default ".length, -2),
+    ) as string;
+    expect(JSON.parse(manifestJson)).toEqual({ buildId: "app-build-a", routes: {}, version: 1 });
+  });
+
+  it("excludes a Vary wildcard route from warming without blocking promotion", async () => {
+    writeTwoStageWorkerArtifact();
+    const wrangler = mockTwoStageWrangler();
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1") {
+        return Response.json(
+          {
+            kind: "app-page",
+            pattern: "/wildcard",
+            reason: "response uses Vary: *",
+            scope: "identity",
+            state: "dynamic",
+            status: 200,
+            version: 1,
+          },
+          { headers: { [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a" } },
+        );
+      }
+      return isReadinessFetch(input)
+        ? readinessResponse()
+        : new Response("unexpected warm request", { status: 500 });
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/wildcard"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/wildcard"],
+          routePatterns: appPageRoutePatterns(["/wildcard"], "/wildcard"),
+          rscPaths: [],
+        }),
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).resolves.toBe("https://my-worker.example.workers.dev");
+
+    expect(wrangler.uploads).toBe(2);
+    expect(wrangler.promoted).toBe(true);
+    expect(getRealWarmFetchCalls()).toHaveLength(1);
+    const manifestJson = JSON.parse(
+      wrangler.finalManifestSource!.slice("export default ".length, -2),
+    ) as string;
+    expect(JSON.parse(manifestJson)).toEqual({
+      buildId: "app-build-a",
+      routes: {
+        '["app-page","/wildcard"]': {
+          kind: "app-page",
+          pattern: "/wildcard",
+          state: "runtime-check",
+        },
+      },
+      version: 1,
+    });
+  });
+
+  it("probes a Pages-only concrete path once before warming HTML and data", async () => {
+    writeTwoStageWorkerArtifact();
+    const wrangler = mockTwoStageWrangler();
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1") {
+        return pagesPageProbeResponse();
+      }
+      if (isReadinessFetch(input)) return readinessResponse();
+      return new URL(formatFetchUrl(input)).pathname.startsWith("/_next/data/")
+        ? cacheablePagesData()
+        : cacheableHtml();
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          pagesDataPaths: ["/_next/data/app-build-a/pages-about.json"],
+          pagesPaths: ["/pages-about"],
+          paths: ["/pages-about"],
+          routePatterns: {
+            "/_next/data/app-build-a/pages-about.json": {
+              cacheabilityProbe: { canPrunePattern: true },
+              kind: "pages-page",
+              pattern: "/pages-about",
+            },
+            "/pages-about": {
+              cacheabilityProbe: { canPrunePattern: true },
+              kind: "pages-page",
+              pattern: "/pages-about",
+            },
+          },
+          rscPaths: [],
+        }),
+        warmCdnPromotionDelay: 0,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).resolves.toBe("https://my-worker.example.workers.dev");
+
+    const requests = vi.mocked(fetch).mock.calls;
+    expect(
+      requests.filter(([, init]) =>
+        new Headers(init?.headers).has(VINEXT_CACHEABILITY_PROBE_HEADER),
+      ),
+    ).toHaveLength(1);
+    expect(
+      requests.filter(
+        ([input, init]) =>
+          !isReadinessFetch(input) &&
+          !new Headers(init?.headers).has(VINEXT_CACHEABILITY_PROBE_HEADER),
+      ),
+    ).toHaveLength(2);
+    expect(wrangler.promoted).toBe(true);
+  });
+
+  it("leaves an empty-manifest final Worker staged when promotion is disabled", async () => {
+    writeTwoStageWorkerArtifact();
+    const wrangler = mockTwoStageWrangler();
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: [],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: [],
+          rscPaths: [],
+        }),
+        warmCdnPromote: false,
+      }),
+    ).resolves.toBe("https://my-worker.example.workers.dev");
+
+    expect(wrangler.uploads).toBe(2);
+    expect(wrangler.finalStaged).toBe(true);
+    expect(wrangler.promoted).toBe(false);
+    expect(wrangler.triggerDeploys).toBe(1);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("does not promote when a staged cache fill cannot be reused", async () => {
+    writeTwoStageWorkerArtifact();
+    let uploadCount = 0;
+    let statusCount = 0;
+    let finalStaged = false;
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) {
+        uploadCount++;
+        return `Uploaded my-worker\nWorker Version ID: ${uploadCount === 1 ? PROBE_VERSION : FINAL_VERSION}\n`;
+      }
+      if (args.includes("status")) {
+        statusCount++;
+        return JSON.stringify({
+          versions:
+            statusCount === 1
+              ? [{ version_id: OLD_VERSION, percentage: 100 }]
+              : finalStaged
+                ? [
+                    { version_id: OLD_VERSION, percentage: 100 },
+                    { version_id: FINAL_VERSION, percentage: 0 },
+                  ]
+                : [
+                    { version_id: OLD_VERSION, percentage: 100 },
+                    { version_id: PROBE_VERSION, percentage: 0 },
+                  ],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) {
+        return "Staged probe version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes(`${FINAL_VERSION}@0%`)) {
+        finalStaged = true;
+        return "Staged final version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes(`${FINAL_VERSION}@100%`)) {
+        throw new Error("final version must not be promoted");
+      }
+      if (args.includes("triggers")) {
+        return "Triggers deployed\nhttps://my-worker.example.workers.dev\n";
+      }
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1") {
+        return appPageProbeResponse();
+      }
+      if (isReadinessFetch(input)) return readinessResponse();
+      return cacheableHtml();
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        dangerouslyPromoteOnCdnWarmError: true,
+        warmCdnCertify: true,
+        warmCdnConcurrency: 1,
+        warmCdnPromotionDelay: 0,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).rejects.toThrow("CF-Cache-Status is MISS; the cache fill is not reusable");
+    expect(uploadCount).toBe(2);
+    expect(
+      (execFileSyncMock.mock.calls as Array<[string, string[]]>).some(([, args]) =>
+        args.includes(`${FINAL_VERSION}@100%`),
+      ),
+    ).toBe(false);
+  });
+
+  it("does not let the dangerous override bypass a failed initial certified fill", async () => {
+    writeTwoStageWorkerArtifact();
+    const wrangler = mockTwoStageWrangler();
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1") {
+        return appPageProbeResponse();
+      }
+      if (isReadinessFetch(input)) return readinessResponse();
+      return new Response("failed fill", {
+        status: 500,
+        headers: {
+          "cache-control": "no-store",
+          [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a",
+        },
+      });
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        dangerouslyPromoteOnCdnWarmError: true,
+        warmCdnCertify: true,
+        warmCdnConcurrency: 1,
+        warmCdnPromotionDelay: 0,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).rejects.toThrow("HTTP 500");
+    expect(wrangler.promoted).toBe(false);
+  });
+
+  it("does not overwrite deployment traffic changed before promotion", async () => {
+    writeTwoStageWorkerArtifact();
+    let uploadCount = 0;
+    let statusCount = 0;
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) {
+        uploadCount++;
+        return `Uploaded my-worker\nWorker Version ID: ${uploadCount === 1 ? PROBE_VERSION : FINAL_VERSION}\n`;
+      }
+      if (args.includes("status")) {
+        statusCount++;
+        const versions =
+          statusCount === 1
+            ? [{ version_id: OLD_VERSION, percentage: 100 }]
+            : statusCount === 6
+              ? [{ version_id: "44444444-4444-4444-8444-444444444444", percentage: 100 }]
+              : statusCount === 5
+                ? [
+                    { version_id: OLD_VERSION, percentage: 100 },
+                    { version_id: FINAL_VERSION, percentage: 0 },
+                  ]
+                : [
+                    { version_id: OLD_VERSION, percentage: 100 },
+                    { version_id: PROBE_VERSION, percentage: 0 },
+                  ];
+        return JSON.stringify({ versions });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) {
+        return "Staged probe version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes(`${FINAL_VERSION}@0%`)) {
+        return "Staged final version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes(`${FINAL_VERSION}@100%`)) {
+        throw new Error("final version must not overwrite the concurrent deployment");
+      }
+      if (args.includes("triggers")) {
+        return "Triggers deployed\nhttps://my-worker.example.workers.dev\n";
+      }
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    let cacheRequestCount = 0;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1") {
+        return appPageProbeResponse();
+      }
+      if (isReadinessFetch(input)) return readinessResponse();
+      cacheRequestCount++;
+      return cacheableHtml("ok", cacheRequestCount === 1 ? "MISS" : "HIT");
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        warmCdnCertify: true,
+        warmCdnConcurrency: 1,
+        warmCdnPromotionDelay: 0,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).rejects.toThrow(
+      "deployment traffic or deployment identity changed before the final version could be promoted",
+    );
+    expect(statusCount).toBe(6);
+    expect(
+      (execFileSyncMock.mock.calls as Array<[string, string[]]>).some(([, args]) =>
+        args.includes(`${FINAL_VERSION}@100%`),
+      ),
+    ).toBe(false);
+  });
+
+  it("leaves production triggers untouched when a route pattern cannot be classified", async () => {
+    writeTwoStageWorkerArtifact();
+    const wrangler = mockTwoStageWrangler();
+    vi.mocked(fetch).mockImplementation(async (input, init) =>
+      new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1"
+        ? appPageProbeResponse("probe-failed")
+        : isReadinessFetch(input)
+          ? readinessResponse()
+          : new Response("unexpected", { status: 500 }),
+    );
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        warmCdnConcurrency: 1,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).rejects.toThrow("render classification failed");
+    expect(wrangler.uploads).toBe(1);
+    expect(wrangler.triggerDeploys).toBe(0);
+    expect(wrangler.promoted).toBe(false);
+  });
+
+  it("leaves production triggers untouched when the manifest-bearing upload fails", async () => {
+    writeTwoStageWorkerArtifact();
+    const wrangler = mockTwoStageWrangler({ failFinalUpload: true });
+    vi.mocked(fetch).mockImplementation(async (input, init) =>
+      new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1"
+        ? appPageProbeResponse()
+        : isReadinessFetch(input)
+          ? readinessResponse()
+          : new Response("unexpected", { status: 500 }),
+    );
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        warmCdnConcurrency: 1,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).rejects.toThrow("final upload failed");
+    expect(wrangler.uploads).toBe(2);
+    expect(wrangler.triggerDeploys).toBe(0);
+    expect(
+      fs.readFileSync(path.join(tmpDir, "dist/server", CACHEABILITY_MANIFEST_MODULE), "utf8"),
+    ).not.toBe("export default null;\n");
+  });
+
+  it.each([
+    { dangerousOverride: false, shouldPromote: false },
+    { dangerousOverride: true, shouldPromote: true },
+  ])(
+    "blocks a skipped prepared cache fill unless the dangerous override is $dangerousOverride",
+    async ({ dangerousOverride, shouldPromote }) => {
+      writeTwoStageWorkerArtifact();
+      const wrangler = mockTwoStageWrangler();
+      vi.mocked(fetch).mockImplementation(async (input, init) => {
+        if (new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1") {
+          return appPageProbeResponse();
+        }
+        if (isReadinessFetch(input)) return readinessResponse();
+        return new Response("private", {
+          headers: {
+            "cache-control": "no-store",
+            "cf-cache-status": "BYPASS",
+            [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a",
+          },
+        });
+      });
+      const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+      const deployment = deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        dangerouslyPromoteOnCdnWarmError: dangerousOverride,
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        warmCdnConcurrency: 1,
+        warmCdnPromotionDelay: 0,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      });
+
+      if (shouldPromote) {
+        await expect(deployment).resolves.toBe("https://my-worker.example.workers.dev");
+      } else {
+        await expect(deployment).rejects.toThrow(
+          "could not fill 1/1 planned cache entries because Cloudflare refused cache admission",
+        );
+      }
+      expect(wrangler.promoted).toBe(shouldPromote);
+    },
+  );
+
+  it("lets prepared cache fills exceed the readiness window while requests keep completing", async () => {
+    writeTwoStageWorkerArtifact();
+    let now = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const wrangler = mockTwoStageWrangler();
+    let fillCalls = 0;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1") {
+        return appPageProbeResponse();
+      }
+      if (isReadinessFetch(input)) return readinessResponse();
+      fillCalls++;
+      now += 120_001;
+      return cacheableHtml();
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/first", "/queued"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/first", "/queued"],
+          routePatterns: appPageRoutePatterns(["/first", "/queued"]),
+          rscPaths: [],
+        }),
+        warmCdnConcurrency: 1,
+        warmCdnPromotionDelay: 0,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).resolves.toBe("https://my-worker.example.workers.dev");
+    expect(fillCalls).toBe(2);
+    expect(wrangler.promoted).toBe(true);
+  });
+
+  it("uses the dedicated cacheability-probe retry budget before the legacy warm fallback", async () => {
+    writeTwoStageWorkerArtifact();
+    let uploads = 0;
+    let probeAttempts = 0;
+    let staged = false;
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) {
+        uploads++;
+        return `Uploaded my-worker\nWorker Version ID: ${PROBE_VERSION}\n`;
+      }
+      if (args.includes("status")) {
+        return JSON.stringify({
+          versions: staged
+            ? [
+                { version_id: OLD_VERSION, percentage: 100 },
+                { version_id: PROBE_VERSION, percentage: 0 },
+              ]
+            : [{ version_id: OLD_VERSION, percentage: 100 }],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) {
+        staged = true;
+        return "Staged probe version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes("triggers")) {
+        return "Triggers deployed\nhttps://my-worker.example.workers.dev\n";
+      }
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1") {
+        probeAttempts++;
+        return new Response("unavailable", {
+          status: 503,
+          headers: { [VINEXT_CDN_BUILD_ID_HEADER]: "app-build-a" },
+        });
+      }
+      return isReadinessFetch(input)
+        ? readinessResponse()
+        : new Response("unexpected", { status: 500 });
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        warmCdnConcurrency: 1,
+        warmCdnProbeRetries: 0,
+        warmCdnProbeTimeout: 100,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 5,
+      }),
+    ).rejects.toThrow("probe returned HTTP 503");
+    expect(probeAttempts).toBe(1);
+    expect(uploads).toBe(1);
+  });
+
+  it("waits for concrete-route version propagation beyond the ordinary probe retry budget", async () => {
+    writeTwoStageWorkerArtifact();
+    const wrangler = mockTwoStageWrangler();
+    let probeAttempts = 0;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1") {
+        probeAttempts++;
+        if (probeAttempts <= 3) {
+          return new Response("previous Worker build", {
+            headers: { [VINEXT_CDN_BUILD_ID_HEADER]: "previous-build" },
+          });
+        }
+        return appPageProbeResponse();
+      }
+      return isReadinessFetch(input) ? readinessResponse() : cacheableHtml();
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        warmCdnConcurrency: 1,
+        warmCdnProbeRetries: 0,
+        warmCdnPromotionDelay: 0,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).resolves.toBe("https://my-worker.example.workers.dev");
+    expect(probeAttempts).toBe(4);
+    expect(wrangler.promoted).toBe(true);
+  });
+
+  it("refuses the final upload when deployment traffic changes during probing", async () => {
+    writeTwoStageWorkerArtifact();
+    let uploads = 0;
+    let statuses = 0;
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) {
+        uploads++;
+        return `Uploaded my-worker\nWorker Version ID: ${PROBE_VERSION}\n`;
+      }
+      if (args.includes("status")) {
+        statuses++;
+        return JSON.stringify({
+          versions:
+            statuses === 1
+              ? [{ version_id: OLD_VERSION, percentage: 100 }]
+              : statuses === 2
+                ? [
+                    { version_id: OLD_VERSION, percentage: 100 },
+                    { version_id: PROBE_VERSION, percentage: 0 },
+                  ]
+                : [
+                    { version_id: OLD_VERSION, percentage: 50 },
+                    { version_id: FINAL_VERSION, percentage: 50 },
+                  ],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) {
+        return "Staged probe version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes("triggers")) {
+        return "Triggers deployed\nhttps://my-worker.example.workers.dev\n";
+      }
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    vi.mocked(fetch).mockImplementation(async (input, init) =>
+      new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1"
+        ? appPageProbeResponse()
+        : isReadinessFetch(input)
+          ? readinessResponse()
+          : new Response("unexpected", { status: 500 }),
+    );
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        warmCdnConcurrency: 1,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).rejects.toThrow("deployment traffic or deployment identity changed");
+    expect(statuses).toBe(3);
+    expect(uploads).toBe(1);
+  });
+
+  it("refuses the final upload when deployment identity changes with identical traffic", async () => {
+    writeTwoStageWorkerArtifact();
+    let statuses = 0;
+    let uploads = 0;
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) {
+        uploads++;
+        return `Uploaded my-worker\nWorker Version ID: ${PROBE_VERSION}\n`;
+      }
+      if (args.includes("status")) {
+        statuses++;
+        return JSON.stringify({
+          id:
+            statuses === 1
+              ? "initial-deployment"
+              : statuses === 2
+                ? "probe-deployment"
+                : "replacement-deployment",
+          versions:
+            statuses === 1
+              ? [{ version_id: OLD_VERSION, percentage: 100 }]
+              : [
+                  { version_id: OLD_VERSION, percentage: 100 },
+                  { version_id: PROBE_VERSION, percentage: 0 },
+                ],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) {
+        return "Staged probe version\nhttps://my-worker.example.workers.dev\n";
+      }
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    vi.mocked(fetch).mockImplementation(async (input, init) =>
+      new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1"
+        ? appPageProbeResponse()
+        : isReadinessFetch(input)
+          ? readinessResponse()
+          : new Response("unexpected", { status: 500 }),
+    );
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        warmCdnConcurrency: 1,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).rejects.toThrow("deployment identity changed while cacheability was being probed");
+    expect(uploads).toBe(1);
+  });
+
+  it("reports when final staging completed before Wrangler failed", async () => {
+    writeTwoStageWorkerArtifact();
+    let uploads = 0;
+    let state: "old" | "probe" | "final" = "old";
+    let triggerDeploys = 0;
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) {
+        uploads++;
+        return `Uploaded my-worker\nWorker Version ID: ${uploads === 1 ? PROBE_VERSION : FINAL_VERSION}\n`;
+      }
+      if (args.includes("status")) {
+        return JSON.stringify({
+          versions:
+            state === "old"
+              ? [{ version_id: OLD_VERSION, percentage: 100 }]
+              : [
+                  { version_id: OLD_VERSION, percentage: 100 },
+                  {
+                    version_id: state === "probe" ? PROBE_VERSION : FINAL_VERSION,
+                    percentage: 0,
+                  },
+                ],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) {
+        state = "probe";
+        return "Staged probe version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes(`${FINAL_VERSION}@0%`)) {
+        state = "final";
+        throw new Error("Wrangler failed while syncing settings");
+      }
+      if (args.includes("triggers")) {
+        triggerDeploys++;
+        return "Triggers must not be applied\n";
+      }
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    vi.mocked(fetch).mockImplementation(async (input, init) =>
+      new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1"
+        ? appPageProbeResponse()
+        : isReadinessFetch(input)
+          ? readinessResponse()
+          : new Response("unexpected", { status: 500 }),
+    );
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        warmCdnConcurrency: 1,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).rejects.toThrow("uploaded version is staged at 0%");
+    expect(triggerDeploys).toBe(0);
+  });
+
+  it("does not stage the final version when traffic changes immediately after its upload", async () => {
+    writeTwoStageWorkerArtifact();
+    let uploads = 0;
+    let statuses = 0;
+    let finalStaged = false;
+    let triggersApplied = false;
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) {
+        uploads++;
+        return `Uploaded my-worker\nWorker Version ID: ${uploads === 1 ? PROBE_VERSION : FINAL_VERSION}\n`;
+      }
+      if (args.includes("status")) {
+        statuses++;
+        return JSON.stringify({
+          versions:
+            statuses === 1
+              ? [{ version_id: OLD_VERSION, percentage: 100 }]
+              : statuses < 4
+                ? [
+                    { version_id: OLD_VERSION, percentage: 100 },
+                    { version_id: PROBE_VERSION, percentage: 0 },
+                  ]
+                : [{ version_id: "44444444-4444-4444-8444-444444444444", percentage: 100 }],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) {
+        return "Staged probe version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes(`${FINAL_VERSION}@0%`)) {
+        finalStaged = true;
+        return "Final version must not be staged";
+      }
+      if (args.includes("triggers")) {
+        triggersApplied = true;
+        return "Triggers must not be applied";
+      }
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    vi.mocked(fetch).mockImplementation(async (input, init) =>
+      new Headers(init?.headers).get(VINEXT_CACHEABILITY_PROBE_HEADER) === "1"
+        ? appPageProbeResponse()
+        : isReadinessFetch(input)
+          ? readinessResponse()
+          : new Response("unexpected", { status: 500 }),
+    );
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: ["/about"],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/about"],
+          routePatterns: appPageRoutePatterns(["/about"]),
+          rscPaths: [],
+        }),
+        warmCdnConcurrency: 1,
+        warmCdnReadinessProbes: 1,
+        warmCdnRetries: 0,
+      }),
+    ).rejects.toThrow("deployment identity changed before the final version could be staged");
+    expect(uploads).toBe(2);
+    expect(statuses).toBe(4);
+    expect(finalStaged).toBe(false);
+    expect(triggersApplied).toBe(false);
   });
 
   it("does not promote when deployment status cannot be read", async () => {
@@ -232,6 +1873,70 @@ describe("Cloudflare CDN warmup deploy flow", () => {
             "22222222-2222-4222-8222-222222222222",
       ),
     ).toBe(true);
+  });
+
+  it("discovers binding-backed paths from the staged version before readiness and warming", async () => {
+    const events: string[] = [];
+    writeFile("wrangler.jsonc", JSON.stringify({ name: "my-worker" }));
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const headers = new Headers(init?.headers);
+      events.push(isReadinessFetch(input) ? "readiness" : "warm");
+      return headers.get("rsc") === "1" ? cacheableRsc() : cacheableHtml();
+    });
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) {
+        return "Uploaded my-worker\nWorker Version ID: 22222222-2222-4222-8222-222222222222\n";
+      }
+      if (args.includes("status")) {
+        return JSON.stringify({
+          versions: [{ version_id: "11111111-1111-4111-8111-111111111111", percentage: 100 }],
+        });
+      }
+      if (args.includes("11111111-1111-4111-8111-111111111111@100%")) {
+        events.push("stage");
+        return "Staged version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes("triggers")) {
+        events.push("triggers");
+        return "Triggers deployed\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes("22222222-2222-4222-8222-222222222222@100%")) {
+        events.push("promote");
+        return "Deployed version\nhttps://my-worker.example.workers.dev\n";
+      }
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await deployWithCdnWarmup(tmpDir, [], {
+      discoverWarmPlan: async ({ headers, targetUrl }) => {
+        events.push("discover");
+        expect(targetUrl).toBe("https://my-worker.example.workers.dev");
+        expect(new Headers(headers).get("Cloudflare-Workers-Version-Overrides")).toBe(
+          'my-worker="22222222-2222-4222-8222-222222222222"',
+        );
+        return {
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: ["/cached/intro"],
+          rscBuildId: "app-build-a",
+          rscPaths: ["/cached/intro"],
+        };
+      },
+      warmCdnPromotionDelay: 0,
+      warmCdnReadinessProbeDelay: 0,
+      warmCdnReadinessProbes: 1,
+    });
+
+    expect(events).toEqual([
+      "stage",
+      "triggers",
+      "discover",
+      "readiness",
+      "warm",
+      "warm",
+      "promote",
+    ]);
   });
 
   it("warms the production custom domain through a 0% staged version override", async () => {
@@ -1167,6 +2872,128 @@ describe("Cloudflare CDN warmup deploy flow", () => {
         warmCdnRetries: 0,
       }),
     ).rejects.toThrow("may remain staged at 0%");
+    expect(
+      (execFileSyncMock.mock.calls as Array<[string, string[]]>).filter(([, args]) =>
+        args.includes("triggers"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("reports when staging completed before Wrangler failed", async () => {
+    writeFile("wrangler.jsonc", JSON.stringify({ name: "my-worker" }));
+    let staged = false;
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) {
+        return `Uploaded version ${PROBE_VERSION}\n`;
+      }
+      if (args.includes("status")) {
+        return JSON.stringify({
+          versions: staged
+            ? [
+                { version_id: OLD_VERSION, percentage: 100 },
+                { version_id: PROBE_VERSION, percentage: 0 },
+              ]
+            : [{ version_id: OLD_VERSION, percentage: 100 }],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) {
+        staged = true;
+        throw new Error("Wrangler failed while syncing settings");
+      }
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, ["/"], {
+        expectedBuildId: "app-build-a",
+      }),
+    ).rejects.toThrow("uploaded version is staged at 0%");
+  });
+
+  it("reports when a failed staging command did not change traffic", async () => {
+    writeFile("wrangler.jsonc", JSON.stringify({ name: "my-worker" }));
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) return `Uploaded version ${PROBE_VERSION}\n`;
+      if (args.includes("status")) {
+        return JSON.stringify({
+          id: "old-deployment",
+          versions: [{ version_id: OLD_VERSION, percentage: 100 }],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) throw new Error("staging failed");
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, ["/"], { expectedBuildId: "app-build-a" }),
+    ).rejects.toThrow("deployment traffic was not changed");
+  });
+
+  it("reports an unknown outcome when failed staging cannot be reconciled", async () => {
+    writeFile("wrangler.jsonc", JSON.stringify({ name: "my-worker" }));
+    let statusReads = 0;
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) return `Uploaded version ${PROBE_VERSION}\n`;
+      if (args.includes("status")) {
+        statusReads++;
+        if (statusReads > 1) throw new Error("status unavailable");
+        return JSON.stringify({
+          versions: [{ version_id: OLD_VERSION, percentage: 100 }],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) throw new Error("staging failed");
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, ["/"], { expectedBuildId: "app-build-a" }),
+    ).rejects.toThrow("deployment outcome is unknown (status unavailable)");
+  });
+
+  it("reports when promotion completed before Wrangler failed", async () => {
+    writeFile(
+      "wrangler.jsonc",
+      JSON.stringify({ name: "my-worker", custom_domains: ["app.example.com"] }),
+    );
+    let state: "old" | "staged" | "promoted" = "old";
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) return `Uploaded version ${PROBE_VERSION}\n`;
+      if (args.includes("status")) {
+        return JSON.stringify({
+          versions:
+            state === "old"
+              ? [{ version_id: OLD_VERSION, percentage: 100 }]
+              : state === "staged"
+                ? [
+                    { version_id: OLD_VERSION, percentage: 100 },
+                    { version_id: PROBE_VERSION, percentage: 0 },
+                  ]
+                : [{ version_id: PROBE_VERSION, percentage: 100 }],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) {
+        state = "staged";
+        return "Staged version\nhttps://my-worker.example.workers.dev\n";
+      }
+      if (args.includes(`${PROBE_VERSION}@100%`)) {
+        state = "promoted";
+        throw new Error("Wrangler failed while syncing settings");
+      }
+      if (args.includes("triggers")) return "Triggers deployed\n";
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, ["/"], {
+        expectedBuildId: "app-build-a",
+        warmCdnPromotionDelay: 0,
+        warmCdnReadinessProbes: 1,
+      }),
+    ).rejects.toThrow("already promoted to 100%");
   });
 
   it("explains staged version cleanup when trigger deployment fails after staging", async () => {
@@ -1210,16 +3037,23 @@ describe("Cloudflare CDN warmup deploy flow", () => {
       "wrangler.jsonc",
       JSON.stringify({ name: "my-worker", custom_domains: ["app.example.com"] }),
     );
+    let staged = false;
     execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
       if (args.includes("upload")) {
         return "Uploaded version 22222222-2222-4222-8222-222222222222\n";
       }
       if (args.includes("status")) {
         return JSON.stringify({
-          versions: [{ version_id: "11111111-1111-4111-8111-111111111111", percentage: 100 }],
+          versions: staged
+            ? [
+                { version_id: "11111111-1111-4111-8111-111111111111", percentage: 100 },
+                { version_id: "22222222-2222-4222-8222-222222222222", percentage: 0 },
+              ]
+            : [{ version_id: "11111111-1111-4111-8111-111111111111", percentage: 100 }],
         });
       }
       if (args.includes("deploy") && args.includes("22222222-2222-4222-8222-222222222222@0%")) {
+        staged = true;
         return "Staged version\nhttps://stable.example.workers.dev\n";
       }
       if (args.includes("deploy") && args.includes("22222222-2222-4222-8222-222222222222@100%")) {
@@ -1235,7 +3069,7 @@ describe("Cloudflare CDN warmup deploy flow", () => {
         expectedBuildId: "app-build-a",
         warmCdnConcurrency: 1,
       }),
-    ).rejects.toThrow("may remain staged at 0%");
+    ).rejects.toThrow("remains staged at 0%");
   });
 
   it("explains promoted version state when fallback trigger deployment fails", async () => {
@@ -1276,6 +3110,77 @@ describe("Cloudflare CDN warmup deploy flow", () => {
       }),
     ).rejects.toThrow("may already be promoted to 100%");
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it.each(["identity", "traffic"] as const)(
+    "rejects no-promote handoff when staged deployment %s changes after warming",
+    async (change) => {
+      writeTwoStageWorkerArtifact();
+      const wrangler = mockTwoStageWrangler({ replaceFinalStageBeforeHandoff: change });
+      const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+      await expect(
+        deployWithCdnWarmup(tmpDir, [], {
+          cacheabilityProbe: true,
+          config: "dist/server/wrangler.json",
+          discoverWarmPlan: async () => ({
+            appPaths: [],
+            buildId: "app-build-a",
+            buildIdentity: "app-build-a",
+            loadingShellPaths: [],
+            paths: [],
+            rscPaths: [],
+          }),
+          warmCdnPromote: false,
+        }),
+      ).rejects.toThrow("changed before the no-promote handoff");
+
+      expect(wrangler.triggerDeploys).toBe(1);
+      expect(wrangler.promoted).toBe(false);
+    },
+  );
+
+  it("explains an unconfirmed deployment after successful probe staging", async () => {
+    writeTwoStageWorkerArtifact();
+    let statusReads = 0;
+    execFileSyncMock.mockImplementation((_file: string, args: string[]) => {
+      if (args.includes("upload")) {
+        return `Uploaded my-worker\nWorker Version ID: ${PROBE_VERSION}\n`;
+      }
+      if (args.includes("status")) {
+        statusReads++;
+        if (statusReads > 1) throw new Error("deployment status unavailable");
+        return JSON.stringify({
+          id: "initial-deployment",
+          versions: [{ version_id: OLD_VERSION, percentage: 100 }],
+        });
+      }
+      if (args.includes(`${PROBE_VERSION}@0%`)) {
+        return "Staged probe version\nhttps://my-worker.example.workers.dev\n";
+      }
+      throw new Error(`Unexpected Wrangler args: ${args.join(" ")}`);
+    });
+    const { deployWithCdnWarmup } = await import("../packages/cloudflare/src/deploy.js");
+
+    await expect(
+      deployWithCdnWarmup(tmpDir, [], {
+        cacheabilityProbe: true,
+        config: "dist/server/wrangler.json",
+        discoverWarmPlan: async () => ({
+          appPaths: [],
+          buildId: "app-build-a",
+          buildIdentity: "app-build-a",
+          loadingShellPaths: [],
+          paths: [],
+          rscPaths: [],
+        }),
+      }),
+    ).rejects.toThrow("probe staging command completed");
+    expect(
+      (execFileSyncMock.mock.calls as Array<[string, string[]]>).filter(([, args]) =>
+        args.includes("triggers"),
+      ),
+    ).toHaveLength(0);
   });
 
   it("does not promote warmup when the existing deployment cannot be staged", async () => {

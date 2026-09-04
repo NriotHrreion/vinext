@@ -27,11 +27,15 @@ The Workers Cache only exposes `ctx.cache` when `cache.enabled: true` is set
 in `wrangler.jsonc`, and the KV adapter needs a matching `VINEXT_KV_CACHE`
 namespace binding — both are configured there.
 
+The incoming Cloudflare cache key must retain the full query string. A Cache
+Rule that ignores or normalizes query parameters can collapse distinct
+manifest identities before the Worker runs.
+
 ## What's in the box
 
 - ISR-cached App Router page at `/cached/[slug]` (`revalidate = 60`).
 - Cached App Route handler at `/api/now` (`revalidate = 30`).
-- Force-dynamic comparison page at `/dynamic`.
+- Late-dynamic personalized comparison page at `/dynamic`.
 - Revalidation API at `/api/revalidate-tag` and `/api/revalidate-path` that
   drives the UI's "Invalidate this page" controls.
 - A client-side **probe** that issues a no-store fetch against a route and
