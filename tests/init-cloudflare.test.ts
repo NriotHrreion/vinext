@@ -103,6 +103,8 @@ export default { plugins: [cssModules.patchCssModules({ generateSourceTypes: tru
 
     expect(result.code).toContain('generateScopedName: "custom_[hash]"');
     expect(result.code).not.toContain("generateScopedName(name, filename)");
+    expect(result.code).not.toContain('from "node:crypto"');
+    expect(result.code).not.toContain('from "node:path"');
     expect(result.preservedExistingGenerateScopedName).toBe(true);
   });
 
@@ -244,6 +246,23 @@ export default defineConfig({
 
   it.each([
     [
+      "plugins are provided only through a root config spread",
+      `const sharedConfig = { plugins: [vinext()] };
+export default {
+  ...sharedConfig,
+};
+`,
+    ],
+    [
+      "a later spread can override the direct plugins array",
+      `const sharedConfig = { plugins: [vinext()] };
+export default {
+  plugins: [],
+  ...sharedConfig,
+};
+`,
+    ],
+    [
       "CSS is provided only through a root config spread",
       `const sharedConfig = { css: { modules: { localsConvention: "camelCase" } } };
 export default {
@@ -283,6 +302,21 @@ export default {
     ],
   ])("rejects ambiguous spread-composed CSS config when $0", (_name, input) => {
     expect(() => updateViteConfigForCssModules("vite.config.ts", input)).toThrow(/spread/i);
+  });
+
+  it("updates the effective plugins array when duplicate properties exist", () => {
+    const input = `export default {
+  plugins: [firstPlugin()],
+  plugins: [vinext()],
+};
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expect(result.code).toContain("plugins: [firstPlugin()]");
+    expect(result.code).toContain(
+      'plugins: [patchCssModules({ exportMode: "default" }), vinext()]',
+    );
   });
 
   it("preserves spread-provided module options when explicit modules follow the CSS spread", () => {

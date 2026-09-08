@@ -602,7 +602,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
       },
       options.cloudflare!,
     );
-  } else if (hasCssModules && existingViteConfigPath) {
+  } else if (hasCssModules && existingViteConfigPath && !options.force) {
     updateViteConfigForCssModules(
       existingViteConfigPath,
       fs.readFileSync(existingViteConfigPath, "utf-8"),

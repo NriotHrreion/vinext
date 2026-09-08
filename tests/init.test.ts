@@ -1492,6 +1492,18 @@ describe("init — guard rails", () => {
     expect(fs.existsSync(path.join(tmpDir, ".gitignore"))).toBe(false);
   });
 
+  it("lets --force replace an unsupported existing CSS Modules config", async () => {
+    setupProject(tmpDir, { router: "pages" });
+    writeFile(tmpDir, "styles.module.css", ".card {}");
+    writeFile(tmpDir, "vite.config.ts", "export default { plugins: [], css: getCss() };\n");
+
+    await expect(runInit(tmpDir, { platform: "node", force: true })).resolves.toBeDefined();
+
+    const config = readFile(tmpDir, "vite.config.ts");
+    expect(config).toContain('patchCssModules({ exportMode: "default" })');
+    expect(config).not.toContain("getCss()");
+  });
+
   it("preserves an existing scoped-name strategy and warns for CSS Modules", async () => {
     setupProject(tmpDir, { router: "pages" });
     writeFile(tmpDir, "styles.module.css", ".card {}");

@@ -1322,7 +1322,7 @@ function findPluginMemberCall(
   member: string,
 ): (ESTree.CallExpression & AstNode) | undefined {
   if (!objectBinding) return undefined;
-  const plugins = findProperty(config, "plugins");
+  const plugins = findLastProperty(config, "plugins");
   if (!plugins || plugins.value.type !== "ArrayExpression") return undefined;
   return plugins.value.elements.find(
     (element): element is ESTree.CallExpression & AstNode =>
@@ -1638,7 +1638,12 @@ function ensurePluginFirst(
   binding: string,
   code: string,
 ): void {
-  const plugins = findProperty(config, "plugins");
+  const plugins = findLastProperty(config, "plugins");
+  if (hasPotentialSpreadOverride(config, plugins)) {
+    throw new Error(
+      "The Vite config's plugins option must be explicitly defined after any spread properties so vinext init can configure CSS Modules without replacing existing plugins.",
+    );
+  }
   if (!plugins) {
     const indent = objectPropertyIndent(config, code);
     insertObjectProperty(output, config, `${indent}plugins: [${expression}],`, code, true);
@@ -1699,9 +1704,7 @@ function ensureCssModulesScopedName(
   output: MagicString,
   config: AstObject,
   code: string,
-  pathBinding: string,
-  createHashBinding: string,
-  rootExpression: string,
+  generateScopedNameSource: (indent: string) => string,
 ): boolean {
   const css = findLastProperty(config, "css");
   if (hasPotentialSpreadOverride(config, css)) {
@@ -1714,11 +1717,8 @@ function ensureCssModulesScopedName(
     insertObjectProperty(
       output,
       config,
-      `${indent}css: {\n${indent}  modules: {\n${generateScopedNameMethodSource(
+      `${indent}css: {\n${indent}  modules: {\n${generateScopedNameSource(
         `${indent}    `,
-        pathBinding,
-        createHashBinding,
-        rootExpression,
       )},\n${indent}  },\n${indent}},`,
       code,
       true,
@@ -1742,12 +1742,7 @@ function ensureCssModulesScopedName(
     insertObjectProperty(
       output,
       cssObject,
-      `${indent}modules: {\n${generateScopedNameMethodSource(
-        `${indent}  `,
-        pathBinding,
-        createHashBinding,
-        rootExpression,
-      )},\n${indent}},`,
+      `${indent}modules: {\n${generateScopedNameSource(`${indent}  `)},\n${indent}},`,
       code,
       true,
     );
@@ -1769,13 +1764,7 @@ function ensureCssModulesScopedName(
     return true;
   }
   const indent = objectPropertyIndent(modulesObject, code);
-  insertObjectProperty(
-    output,
-    modulesObject,
-    `${generateScopedNameMethodSource(indent, pathBinding, createHashBinding, rootExpression)},`,
-    code,
-    true,
-  );
+  insertObjectProperty(output, modulesObject, `${generateScopedNameSource(indent)},`, code, true);
   return false;
 }
 
@@ -1839,36 +1828,53 @@ export function updateViteConfigForCssModules(
   const secondConfig = findConfigObject(secondProgram)!;
   const secondBindings = collectTopLevelBindings(secondProgram);
   const secondOutput = new MagicString(withPlugin);
-  const existingCreateHash = commonJs
-    ? findRequiredBinding(secondProgram, "node:crypto", "createHash")
-    : findImportedBinding(secondProgram, "node:crypto", "createHash");
-  const createHashLocal = existingCreateHash ?? allocateBinding(secondBindings, "createHash");
-  const createHashBinding = commonJs
-    ? ensureNamedRequire(secondProgram, secondOutput, "node:crypto", "createHash", createHashLocal)
-    : ensureNamedImport(secondProgram, secondOutput, "node:crypto", "createHash", createHashLocal);
-  const existingPath = commonJs
-    ? findRequiredBinding(secondProgram, "node:path", "default")
-    : secondProgram.body
-        .filter(
-          (statement): statement is ESTree.ImportDeclaration =>
-            statement.type === "ImportDeclaration",
-        )
-        .find((statement) => statement.source.value === "node:path")
-        ?.specifiers.find(
-          (specifier): specifier is ESTree.ImportDefaultSpecifier =>
-            specifier.type === "ImportDefaultSpecifier",
-        )?.local.name;
-  const pathLocal = existingPath ?? allocateBinding(secondBindings, "path");
-  const pathBinding = commonJs
-    ? ensureDefaultRequire(secondProgram, secondOutput, "node:path", pathLocal)
-    : ensureDefaultImport(secondProgram, secondOutput, "node:path", pathLocal);
   const preservedExistingGenerateScopedName = ensureCssModulesScopedName(
     secondOutput,
     secondConfig,
     withPlugin,
-    pathBinding,
-    createHashBinding,
-    commonJs ? "__dirname" : "import.meta.dirname",
+    (indent) => {
+      const existingCreateHash = commonJs
+        ? findRequiredBinding(secondProgram, "node:crypto", "createHash")
+        : findImportedBinding(secondProgram, "node:crypto", "createHash");
+      const createHashLocal = existingCreateHash ?? allocateBinding(secondBindings, "createHash");
+      const createHashBinding = commonJs
+        ? ensureNamedRequire(
+            secondProgram,
+            secondOutput,
+            "node:crypto",
+            "createHash",
+            createHashLocal,
+          )
+        : ensureNamedImport(
+            secondProgram,
+            secondOutput,
+            "node:crypto",
+            "createHash",
+            createHashLocal,
+          );
+      const existingPath = commonJs
+        ? findRequiredBinding(secondProgram, "node:path", "default")
+        : secondProgram.body
+            .filter(
+              (statement): statement is ESTree.ImportDeclaration =>
+                statement.type === "ImportDeclaration",
+            )
+            .find((statement) => statement.source.value === "node:path")
+            ?.specifiers.find(
+              (specifier): specifier is ESTree.ImportDefaultSpecifier =>
+                specifier.type === "ImportDefaultSpecifier",
+            )?.local.name;
+      const pathLocal = existingPath ?? allocateBinding(secondBindings, "path");
+      const pathBinding = commonJs
+        ? ensureDefaultRequire(secondProgram, secondOutput, "node:path", pathLocal)
+        : ensureDefaultImport(secondProgram, secondOutput, "node:path", pathLocal);
+      return generateScopedNameMethodSource(
+        indent,
+        pathBinding,
+        createHashBinding,
+        commonJs ? "__dirname" : "import.meta.dirname",
+      );
+    },
   );
   const updated = secondOutput.toString();
   return {
