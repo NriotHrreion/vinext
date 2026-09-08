@@ -290,6 +290,11 @@ describe("scanCssModuleFiles", () => {
     writeFile(tmpDir, "src/styles.module.CSS", ".card {}");
     expect(scanCssModuleFiles(tmpDir)).toBe(false);
   });
+
+  it("does not treat nested source directories as root build output", () => {
+    writeFile(tmpDir, "app/build/components/card.module.css", ".card {}");
+    expect(scanCssModuleFiles(tmpDir)).toBe(true);
+  });
 });
 
 // ─── Unit Tests: addScripts ──────────────────────────────────────────────────
@@ -1523,13 +1528,13 @@ describe("init — guard rails", () => {
     writeFile(
       tmpDir,
       "vite.config.ts",
-      'export default { plugins: [], css: { modules: { generateScopedName: "custom_[hash]" } } };',
+      'export default { plugins: [], css: { modules: { generateScopedName: "custom_[local]" } } };',
     );
 
     const { output } = await runInit(tmpDir, { platform: "node" });
 
     const config = readFile(tmpDir, "vite.config.ts");
-    expect(config).toContain('generateScopedName: "custom_[hash]"');
+    expect(config).toContain('generateScopedName: "custom_[local]"');
     expect(config).toContain('patchCssModules({ exportMode: "default" })');
     expect(config).not.toContain("patchCssModules()");
     expect(output).toContain("Preserved existing css.modules.generateScopedName");

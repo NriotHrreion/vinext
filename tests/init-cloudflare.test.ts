@@ -139,17 +139,54 @@ export default { plugins: [] } satisfies UserConfig;
   it("preserves an existing generateScopedName", () => {
     const input = `export default {
   plugins: [],
-  css: { modules: { generateScopedName: "custom_[hash]" } },
+  css: { modules: { generateScopedName: "custom_[local]" } },
 };
 `;
 
     const result = updateViteConfigForCssModules("vite.config.ts", input);
 
-    expect(result.code).toContain('generateScopedName: "custom_[hash]"');
+    expect(result.code).toContain('generateScopedName: "custom_[local]"');
     expect(result.code).not.toContain("generateScopedName(name: string, filename: string)");
     expect(result.code).not.toContain('from "node:crypto"');
     expect(result.code).not.toContain('from "node:path"');
     expect(result.preservedExistingGenerateScopedName).toBe(true);
+  });
+
+  it("replaces an environment-dependent hash-template scoped name", () => {
+    const input = `export default {
+  plugins: [],
+  css: { modules: { generateScopedName: "[name]__[local]___[hash:base64:5]" } },
+};
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain("generateScopedName(name: string, filename: string)");
+    expect(result.code).not.toContain("[hash:base64:5]");
+    expect(result.preservedExistingGenerateScopedName).toBe(false);
+  });
+
+  it.each([
+    [
+      "through an exported variable",
+      `const options = { plugins: [] };
+const config = defineConfig(options);
+export default config;
+`,
+    ],
+    [
+      "as the direct defineConfig argument",
+      `const options = { plugins: [] };
+export default defineConfig(options);
+`,
+    ],
+  ])("resolves a static config object $0", (_name, input) => {
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain('plugins: [patchCssModules({ exportMode: "default" })]');
+    expect(result.code).toContain("generateScopedName(name: string, filename: string)");
   });
 
   it.each(["undefined", "null"])("replaces a nullish %s scoped-name setting", (value) => {

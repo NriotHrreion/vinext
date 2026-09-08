@@ -847,7 +847,13 @@ function unwrapObject(expression: ESTree.Expression): AstObject | undefined {
   return unwrapped?.type === "ObjectExpression" ? (unwrapped as AstObject) : undefined;
 }
 
-function findVariableObject(program: ESTree.Program, name: string): AstObject | undefined {
+function findVariableObject(
+  program: ESTree.Program,
+  name: string,
+  seen = new Set<string>(),
+): AstObject | undefined {
+  if (seen.has(name)) return undefined;
+  seen.add(name);
   for (const statement of program.body) {
     if (statement.type !== "VariableDeclaration") continue;
     for (const declaration of statement.declarations) {
@@ -858,7 +864,23 @@ function findVariableObject(program: ESTree.Program, name: string): AstObject | 
       ) {
         continue;
       }
-      return unwrapObject(declaration.init);
+      const direct = unwrapObject(declaration.init);
+      if (direct) return direct;
+      const initializer = unwrapExpression(declaration.init);
+      if (initializer?.type === "Identifier") {
+        return findVariableObject(program, initializer.name, seen);
+      }
+      if (initializer?.type !== "CallExpression" || initializer.arguments.length === 0) {
+        return undefined;
+      }
+      const firstArgument = initializer.arguments[0];
+      if (firstArgument.type === "SpreadElement") return undefined;
+      const argumentObject = unwrapObject(firstArgument);
+      if (argumentObject) return argumentObject;
+      if (firstArgument.type === "Identifier") {
+        return findVariableObject(program, firstArgument.name, seen);
+      }
+      return undefined;
     }
   }
   return undefined;
@@ -907,6 +929,9 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
   if (firstArgument.type === "SpreadElement") return undefined;
   const argumentObject = unwrapObject(firstArgument);
   if (argumentObject) return argumentObject;
+  if (firstArgument.type === "Identifier") {
+    return findVariableObject(program, firstArgument.name);
+  }
   if (
     firstArgument.type !== "ArrowFunctionExpression" &&
     firstArgument.type !== "FunctionExpression"
@@ -1810,7 +1835,12 @@ function ensureCssModulesScopedName(
         "The Vite config's css.modules.generateScopedName option must appear after any spread properties so vinext init can verify it.",
       );
     }
-    if (!hasNullishValue(generateScopedName)) return true;
+    const value = generateScopedName.value as AstNode & { value?: unknown };
+    const usesHashTemplate =
+      value.type === "Literal" &&
+      typeof value.value === "string" &&
+      /\[hash(?::[^\]]*)?\]/i.test(value.value);
+    if (!hasNullishValue(generateScopedName) && !usesHashTemplate) return true;
     const indent = objectPropertyIndent(modulesObject, code);
     output.overwrite(
       (generateScopedName as AstNode).start,

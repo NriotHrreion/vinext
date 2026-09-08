@@ -17,7 +17,7 @@
  */
 
 import fs from "node:fs";
-import path from "pathslash";
+import path, { toSlash } from "pathslash";
 import { spawn, spawnSync } from "node:child_process";
 import {
   detectProject,
@@ -159,27 +159,23 @@ export default defineConfig({
 }
 
 const CSS_MODULE_PATTERN = /\.module\.(?:css|scss|sass)$/;
-const CSS_MODULE_SCAN_IGNORES = new Set([
-  "node_modules",
-  ".next",
-  ".vinext",
-  ".wrangler",
-  "dist",
-  "out",
-  "build",
-  "coverage",
-]);
+const CSS_MODULE_SCAN_IGNORES = new Set(["node_modules", ".next", ".vinext", ".wrangler"]);
+const CSS_MODULE_ROOT_SCAN_IGNORES = new Set(["dist", "out", "build", "coverage"]);
 
 /** Detect project-owned CSS, SCSS, or Sass module files. */
 export function scanCssModuleFiles(root: string): boolean {
   try {
+    const canonicalRoot = path.resolve(root);
     return fs
       .globSync("**/*.module.{css,scss,sass}", {
         cwd: root,
         withFileTypes: true,
         exclude: (entry) =>
           entry.isDirectory() &&
-          (entry.name.startsWith(".") || CSS_MODULE_SCAN_IGNORES.has(entry.name)),
+          (entry.name.startsWith(".") ||
+            CSS_MODULE_SCAN_IGNORES.has(entry.name) ||
+            (toSlash(entry.parentPath) === canonicalRoot &&
+              CSS_MODULE_ROOT_SCAN_IGNORES.has(entry.name))),
       })
       .some((entry) => CSS_MODULE_PATTERN.test(entry.name));
   } catch {
