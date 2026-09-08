@@ -268,7 +268,7 @@ describe("generateViteConfig", () => {
     expect(config).toContain(patchCall);
     expect(config.indexOf(patchCall)).toBeLessThan(config.indexOf("vinext()"));
     expect(config).not.toContain("patchCssModules()");
-    expect(config).toContain("generateScopedName(name, filename)");
+    expect(config).toContain("generateScopedName(name: string, filename: string)");
     expect(config).toContain("import.meta.dirname");
     expect(config).toContain(".slice(0, 7)");
   });
@@ -1224,7 +1224,7 @@ describe("init — dependency installation", () => {
     expect(config).toContain(patchCall);
     expect(config.indexOf(patchCall)).toBeLessThan(config.indexOf("vinext()"));
     expect(config).not.toContain("patchCssModules()");
-    expect(config).toContain("generateScopedName(name, filename)");
+    expect(config).toContain("generateScopedName(name: string, filename: string)");
     expect(output).toContain("Configured vite-css-modules for CSS Modules");
   });
 
@@ -1501,6 +1501,19 @@ describe("init — guard rails", () => {
 
     const config = readFile(tmpDir, "vite.config.ts");
     expect(config).toContain('patchCssModules({ exportMode: "default" })');
+    expect(config).not.toContain("getCss()");
+  });
+
+  it("lets Cloudflare --force replace unsupported CSS Modules options", async () => {
+    setupProject(tmpDir, { router: "pages" });
+    writeFile(tmpDir, "styles.module.css", ".card {}");
+    writeFile(tmpDir, "vite.config.ts", "export default { plugins: [], css: getCss() };\n");
+
+    await expect(runInit(tmpDir, { force: true })).resolves.toBeDefined();
+
+    const config = readFile(tmpDir, "vite.config.ts");
+    expect(config).toContain('patchCssModules({ exportMode: "default" })');
+    expect(config).toContain("generateScopedName(name: string, filename: string)");
     expect(config).not.toContain("getCss()");
   });
 

@@ -29,6 +29,7 @@ export type CloudflarePlatformSetupContext = {
   root: string;
   isAppRouter: boolean;
   existingViteConfigPath?: string;
+  force?: boolean;
   prerender?: boolean;
   hasCssModules?: boolean;
   today?: string;
@@ -82,7 +83,11 @@ export function validateCloudflarePlatformSetup(
       },
     );
     if (context.hasCssModules) {
-      updateViteConfigForCssModules(context.existingViteConfigPath, cloudflareConfig);
+      updateViteConfigForCssModules(
+        context.existingViteConfigPath,
+        cloudflareConfig,
+        context.force,
+      );
     }
   }
 }
@@ -127,6 +132,7 @@ export function setupCloudflarePlatform(
       const cssUpdate = updateViteConfigForCssModules(
         context.existingViteConfigPath,
         updatedConfig,
+        context.force,
       );
       updatedConfig = cssUpdate.code;
       preservedExistingGenerateScopedName = cssUpdate.preservedExistingGenerateScopedName;
@@ -593,8 +599,10 @@ function generateScopedNameMethodSource(
   pathBinding: string,
   createHashBinding: string,
   rootExpression = "import.meta.dirname",
+  typescript = true,
 ): string {
-  return `${indent}generateScopedName(name, filename) {
+  const parameters = typescript ? "name: string, filename: string" : "name, filename";
+  return `${indent}generateScopedName(${parameters}) {
 ${indent}  const relativePath = ${pathBinding}
 ${indent}    .relative(${rootExpression}, filename.replace(/\\?.*$/, ""))
 ${indent}    .replaceAll("\\\\", "/");
@@ -813,6 +821,14 @@ function findLastProperty(object: AstObject, name: string): AstProperty | undefi
     if (property.type === "Property" && propertyName(property) === name) return property;
   }
   return undefined;
+}
+
+function hasNullishValue(property: AstProperty): boolean {
+  const value = property.value as AstNode & { name?: string; value?: unknown };
+  return (
+    (value.type === "Identifier" && value.name === "undefined") ||
+    (value.type === "Literal" && value.value === null)
+  );
 }
 
 /**
@@ -1406,12 +1422,7 @@ function hasVinextPrerender(call: (ESTree.CallExpression & AstNode) | undefined)
 }
 
 function isUsableImageOptimizer(property: AstProperty | undefined): boolean {
-  if (!property) return false;
-  const value = property.value as AstNode & { name?: string; value?: unknown };
-  return !(
-    (value.type === "Identifier" && value.name === "undefined") ||
-    (value.type === "Literal" && value.value === null)
-  );
+  return Boolean(property && !hasNullishValue(property));
 }
 
 function isImagesOptimizerCall(
@@ -1722,6 +1733,7 @@ function ensureCssModulesScopedName(
   config: AstObject,
   code: string,
   generateScopedNameSource: (indent: string) => string,
+  force = false,
 ): boolean {
   const css = findLastProperty(config, "css");
   if (hasPotentialSpreadOverride(config, css)) {
@@ -1743,6 +1755,17 @@ function ensureCssModulesScopedName(
     return false;
   }
   if (css.value.type !== "ObjectExpression") {
+    if (force) {
+      const indent = objectPropertyIndent(config, code);
+      output.overwrite(
+        (css.value as AstNode).start,
+        (css.value as AstNode).end,
+        `{\n${indent}  modules: {\n${generateScopedNameSource(
+          `${indent}    `,
+        )},\n${indent}  },\n${indent}}`,
+      );
+      return false;
+    }
     throw new Error(
       "The Vite config's css option must be a static object for vinext init to configure CSS Modules.",
     );
@@ -1766,6 +1789,15 @@ function ensureCssModulesScopedName(
     return false;
   }
   if (modules.value.type !== "ObjectExpression") {
+    if (force) {
+      const indent = objectPropertyIndent(cssObject, code);
+      output.overwrite(
+        (modules.value as AstNode).start,
+        (modules.value as AstNode).end,
+        `{\n${generateScopedNameSource(`${indent}  `)},\n${indent}}`,
+      );
+      return false;
+    }
     throw new Error(
       "The Vite config's css.modules option must be a static object for vinext init to configure CSS Modules.",
     );
@@ -1778,7 +1810,14 @@ function ensureCssModulesScopedName(
         "The Vite config's css.modules.generateScopedName option must appear after any spread properties so vinext init can verify it.",
       );
     }
-    return true;
+    if (!hasNullishValue(generateScopedName)) return true;
+    const indent = objectPropertyIndent(modulesObject, code);
+    output.overwrite(
+      (generateScopedName as AstNode).start,
+      (generateScopedName as AstNode).end,
+      generateScopedNameSource(indent),
+    );
+    return false;
   }
   const indent = objectPropertyIndent(modulesObject, code);
   insertObjectProperty(output, modulesObject, `${generateScopedNameSource(indent)},`, code, true);
@@ -1795,6 +1834,7 @@ export type CssModulesConfigUpdate = {
 export function updateViteConfigForCssModules(
   filePath: string,
   code: string,
+  force = false,
 ): CssModulesConfigUpdate {
   const firstProgram = parseViteConfig(filePath, code);
   const firstConfig = findConfigObject(firstProgram);
@@ -1890,8 +1930,10 @@ export function updateViteConfigForCssModules(
         pathBinding,
         createHashBinding,
         commonJs ? "__dirname" : "import.meta.dirname",
+        [".ts", ".mts", ".cts"].includes(path.extname(filePath)),
       );
     },
+    force,
   );
   const updated = secondOutput.toString();
   return {

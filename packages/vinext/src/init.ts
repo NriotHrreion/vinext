@@ -591,6 +591,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
         root,
         isAppRouter: isApp,
         existingViteConfigPath,
+        force: options.force,
         prerender: options.prerender,
         hasCssModules,
         today: options._today,

@@ -32,7 +32,7 @@ describe("updateViteConfigForCssModules", () => {
       expect(config).toContain(patchCall);
       expect(config.indexOf(patchCall)).toBeLessThan(config.indexOf("vinext("));
       expect(config).not.toContain("patchCssModules()");
-      expect(config).toContain("generateScopedName(name, filename)");
+      expect(config).toContain("generateScopedName(name: string, filename: string)");
       expect(config.match(/from "node:path"/g)).toHaveLength(1);
     }
   });
@@ -56,7 +56,7 @@ export default {
     expect(result.code).not.toContain("patchCssModules()");
     expect(result.code).toContain('localsConvention: "camelCase"');
     expect(result.code).toContain("server: { port: 4321 }");
-    expect(result.code).toContain("generateScopedName(name, filename)");
+    expect(result.code).toContain("generateScopedName(name: string, filename: string)");
     expect(result.preservedExistingGenerateScopedName).toBe(false);
   });
 
@@ -89,7 +89,7 @@ export default { plugins: [cssModules.patchCssModules({ generateSourceTypes: tru
     expect(result.code).not.toContain("import { patchCssModules }");
     expect(result.code).toContain("cssModules.patchCssModules({ generateSourceTypes: true })");
     expect(result.code).not.toContain('exportMode: "default"');
-    expect(result.code).toContain("generateScopedName(name, filename)");
+    expect(result.code).toContain("generateScopedName(name: string, filename: string)");
   });
 
   it("does not reuse type-only imports as runtime bindings", () => {
@@ -122,7 +122,18 @@ export default { plugins: [] } satisfies UserConfig;
 
     expectValidConfig(result.code);
     expect(result.code).toContain('plugins: [patchCssModules({ exportMode: "default" })]');
+    expect(result.code).toContain("generateScopedName(name: string, filename: string)");
+  });
+
+  it("keeps inserted scoped-name parameters JavaScript-safe", () => {
+    const result = updateViteConfigForCssModules(
+      "vite.config.mjs",
+      "export default { plugins: [] };\n",
+    );
+
+    expectValidConfig(result.code);
     expect(result.code).toContain("generateScopedName(name, filename)");
+    expect(result.code).not.toContain("name: string");
   });
 
   it("preserves an existing generateScopedName", () => {
@@ -135,10 +146,25 @@ export default { plugins: [] } satisfies UserConfig;
     const result = updateViteConfigForCssModules("vite.config.ts", input);
 
     expect(result.code).toContain('generateScopedName: "custom_[hash]"');
-    expect(result.code).not.toContain("generateScopedName(name, filename)");
+    expect(result.code).not.toContain("generateScopedName(name: string, filename: string)");
     expect(result.code).not.toContain('from "node:crypto"');
     expect(result.code).not.toContain('from "node:path"');
     expect(result.preservedExistingGenerateScopedName).toBe(true);
+  });
+
+  it.each(["undefined", "null"])("replaces a nullish %s scoped-name setting", (value) => {
+    const input = `export default {
+  plugins: [],
+  css: { modules: { generateScopedName: ${value} } },
+};
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain("generateScopedName(name: string, filename: string)");
+    expect(result.code).not.toContain(`generateScopedName: ${value}`);
+    expect(result.preservedExistingGenerateScopedName).toBe(false);
   });
 
   it("keeps the comma after an existing multiline css property", () => {
@@ -202,7 +228,9 @@ export default defineConfig({
       const result = updateViteConfigForCssModules("vite.config.ts", input);
       expectValidConfig(result.code);
       expect(result.code).toContain('plugins: [patchCssModules({ exportMode: "default" })]');
-      expect(result.code).toContain("modules: {\n      generateScopedName(name, filename)");
+      expect(result.code).toContain(
+        "modules: {\n      generateScopedName(name: string, filename: string)",
+      );
       expect(result.code).not.toMatch(/\n[\t ]*\n/);
     }
   });
@@ -249,7 +277,7 @@ export default defineConfig({
 
     expectValidConfig(result.code);
     expect(result.code).toContain("keep nested comment");
-    expect(result.code).toContain("generateScopedName(name, filename)");
+    expect(result.code).toContain("generateScopedName(name: string, filename: string)");
     expect(result.code).not.toMatch(/\n[\t ]*\n/);
   });
 
@@ -368,7 +396,7 @@ export default {
     expectValidConfig(result.code);
     expect(result.code).toContain("...sharedCss.modules");
     expect(result.code.indexOf("...sharedCss.modules")).toBeLessThan(
-      result.code.indexOf("generateScopedName(name, filename)"),
+      result.code.indexOf("generateScopedName(name: string, filename: string)"),
     );
   });
 });
