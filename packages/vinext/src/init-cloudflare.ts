@@ -823,11 +823,11 @@ function findLastProperty(object: AstObject, name: string): AstProperty | undefi
   return undefined;
 }
 
-function hasNullishValue(property: AstProperty): boolean {
-  const value = property.value as AstNode & { name?: string; value?: unknown };
+function isNullishValue(value: ESTree.Node): boolean {
+  const candidate = value as AstNode & { name?: string; value?: unknown };
   return (
-    (value.type === "Identifier" && value.name === "undefined") ||
-    (value.type === "Literal" && value.value === null)
+    (candidate.type === "Identifier" && candidate.name === "undefined") ||
+    (candidate.type === "Literal" && candidate.value === null)
   );
 }
 
@@ -850,10 +850,11 @@ function unwrapObject(expression: ESTree.Expression): AstObject | undefined {
 function isDefineConfigCall(program: ESTree.Program, call: ESTree.CallExpression): boolean {
   const callee = unwrapExpression(call.callee);
   if (callee?.type === "Identifier") {
+    const imported = findImportedBinding(program, "vite", "defineConfig");
+    const required = findRequiredBinding(program, "vite", "defineConfig");
     return (
-      callee.name === "defineConfig" ||
-      callee.name === findImportedBinding(program, "vite", "defineConfig") ||
-      callee.name === findRequiredBinding(program, "vite", "defineConfig")
+      (imported !== undefined && callee.name === imported) ||
+      (required !== undefined && callee.name === required)
     );
   }
   if (
@@ -1495,7 +1496,7 @@ function hasVinextPrerender(call: (ESTree.CallExpression & AstNode) | undefined)
 }
 
 function isUsableImageOptimizer(property: AstProperty | undefined): boolean {
-  return Boolean(property && !hasNullishValue(property));
+  return Boolean(property && !isNullishValue(property.value));
 }
 
 function isImagesOptimizerCall(
@@ -1891,7 +1892,7 @@ function ensureCssModulesScopedName(
           ? (value.quasis[0]?.value.cooked ?? value.quasis[0]?.value.raw)
           : undefined;
     const usesHashTemplate = staticValue !== undefined && /\[hash(?::[^\]]*)?\]/i.test(staticValue);
-    if (!hasNullishValue(generateScopedName) && !usesHashTemplate) return true;
+    if (value && !isNullishValue(value) && !usesHashTemplate) return true;
     const indent = objectPropertyIndent(modulesObject, code);
     output.overwrite(
       (generateScopedName as AstNode).start,
