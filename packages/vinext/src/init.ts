@@ -172,24 +172,19 @@ const CSS_MODULE_SCAN_IGNORES = new Set([
 
 /** Detect project-owned CSS, SCSS, or Sass module files. */
 export function scanCssModuleFiles(root: string): boolean {
-  const walk = (current: string): boolean => {
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch {
-      return false;
-    }
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (entry.name.startsWith(".") || CSS_MODULE_SCAN_IGNORES.has(entry.name)) continue;
-        if (walk(path.join(current, entry.name))) return true;
-      } else if (entry.isFile() && CSS_MODULE_PATTERN.test(entry.name)) {
-        return true;
-      }
-    }
+  try {
+    return fs
+      .globSync("**/*.module.{css,scss,sass}", {
+        cwd: root,
+        withFileTypes: true,
+        exclude: (entry) =>
+          entry.isDirectory() &&
+          (entry.name.startsWith(".") || CSS_MODULE_SCAN_IGNORES.has(entry.name)),
+      })
+      .some((entry) => CSS_MODULE_PATTERN.test(entry.name));
+  } catch {
     return false;
-  };
-  return walk(root);
+  }
 }
 
 // ─── Script Addition ─────────────────────────────────────────────────────────
