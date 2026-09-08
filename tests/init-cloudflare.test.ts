@@ -152,10 +152,14 @@ export default { plugins: [] } satisfies UserConfig;
     expect(result.preservedExistingGenerateScopedName).toBe(true);
   });
 
-  it("replaces an environment-dependent hash-template scoped name", () => {
+  it.each([
+    ['"[name]__[local]___[hash:base64:5]"', "string"],
+    ['"[name]__[local]___[hash:base64:5]" as const', "typed string"],
+    ["`[name]__[local]___[hash:base64:5]`", "template string"],
+  ])("replaces an environment-dependent hash-template $1", (scopedName) => {
     const input = `export default {
   plugins: [],
-  css: { modules: { generateScopedName: "[name]__[local]___[hash:base64:5]" } },
+  css: { modules: { generateScopedName: ${scopedName} } },
 };
 `;
 
@@ -187,6 +191,42 @@ export default defineConfig(options);
     expectValidConfig(result.code);
     expect(result.code).toContain('plugins: [patchCssModules({ exportMode: "default" })]');
     expect(result.code).toContain("generateScopedName(name: string, filename: string)");
+  });
+
+  it("resolves an identifier argument in a CommonJS defineConfig call", () => {
+    const input = `const { defineConfig } = require("vite");
+const options = { plugins: [] };
+module.exports = defineConfig(options);
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.cjs", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain('plugins: [patchCssModules({ exportMode: "default" })]');
+    expect(result.code).toContain("generateScopedName(name, filename)");
+  });
+
+  it("recognizes a namespace-imported defineConfig call", () => {
+    const input = `import * as vite from "vite";
+const options = { plugins: [] };
+export default vite.defineConfig(options);
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain('plugins: [patchCssModules({ exportMode: "default" })]');
+  });
+
+  it("rejects config objects hidden behind arbitrary factory calls", () => {
+    const input = `const base = { plugins: [] };
+const config = mergeConfig(base, overrides);
+export default config;
+`;
+
+    expect(() => updateViteConfigForCssModules("vite.config.ts", input)).toThrow(
+      "Could not find a static Vite config object",
+    );
   });
 
   it.each(["undefined", "null"])("replaces a nullish %s scoped-name setting", (value) => {

@@ -847,6 +847,35 @@ function unwrapObject(expression: ESTree.Expression): AstObject | undefined {
   return unwrapped?.type === "ObjectExpression" ? (unwrapped as AstObject) : undefined;
 }
 
+function isDefineConfigCall(program: ESTree.Program, call: ESTree.CallExpression): boolean {
+  const callee = unwrapExpression(call.callee);
+  if (callee?.type === "Identifier") {
+    return (
+      callee.name === "defineConfig" ||
+      callee.name === findImportedBinding(program, "vite", "defineConfig") ||
+      callee.name === findRequiredBinding(program, "vite", "defineConfig")
+    );
+  }
+  if (
+    callee?.type !== "MemberExpression" ||
+    callee.object.type !== "Identifier" ||
+    !(
+      (!callee.computed &&
+        callee.property.type === "Identifier" &&
+        callee.property.name === "defineConfig") ||
+      (callee.computed &&
+        callee.property.type === "Literal" &&
+        callee.property.value === "defineConfig")
+    )
+  ) {
+    return false;
+  }
+  return (
+    callee.object.name === findNamespaceImportedBinding(program, "vite") ||
+    callee.object.name === findRequiredBinding(program, "vite", "default")
+  );
+}
+
 function findVariableObject(
   program: ESTree.Program,
   name: string,
@@ -870,7 +899,11 @@ function findVariableObject(
       if (initializer?.type === "Identifier") {
         return findVariableObject(program, initializer.name, seen);
       }
-      if (initializer?.type !== "CallExpression" || initializer.arguments.length === 0) {
+      if (
+        initializer?.type !== "CallExpression" ||
+        !isDefineConfigCall(program, initializer) ||
+        initializer.arguments.length === 0
+      ) {
         return undefined;
       }
       const firstArgument = initializer.arguments[0];
@@ -907,9 +940,18 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
       }
       const direct = unwrapObject(expression.right);
       if (direct) return direct;
-      if (expression.right.type === "CallExpression" && expression.right.arguments.length > 0) {
+      if (
+        expression.right.type === "CallExpression" &&
+        isDefineConfigCall(program, expression.right) &&
+        expression.right.arguments.length > 0
+      ) {
         const firstArgument = expression.right.arguments[0];
-        if (firstArgument.type !== "SpreadElement") return unwrapObject(firstArgument);
+        if (firstArgument.type === "SpreadElement") return undefined;
+        const argumentObject = unwrapObject(firstArgument);
+        if (argumentObject) return argumentObject;
+        if (firstArgument.type === "Identifier") {
+          return findVariableObject(program, firstArgument.name);
+        }
       }
     }
     return undefined;
@@ -923,7 +965,13 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
   const direct = unwrapObject(declaration);
   if (direct) return direct;
   if (declaration.type === "Identifier") return findVariableObject(program, declaration.name);
-  if (declaration.type !== "CallExpression" || declaration.arguments.length === 0) return undefined;
+  if (
+    declaration.type !== "CallExpression" ||
+    !isDefineConfigCall(program, declaration) ||
+    declaration.arguments.length === 0
+  ) {
+    return undefined;
+  }
 
   const firstArgument = declaration.arguments[0];
   if (firstArgument.type === "SpreadElement") return undefined;
@@ -1835,11 +1883,14 @@ function ensureCssModulesScopedName(
         "The Vite config's css.modules.generateScopedName option must appear after any spread properties so vinext init can verify it.",
       );
     }
-    const value = generateScopedName.value as AstNode & { value?: unknown };
-    const usesHashTemplate =
-      value.type === "Literal" &&
-      typeof value.value === "string" &&
-      /\[hash(?::[^\]]*)?\]/i.test(value.value);
+    const value = unwrapExpression(generateScopedName.value);
+    const staticValue =
+      value?.type === "Literal" && typeof value.value === "string"
+        ? value.value
+        : value?.type === "TemplateLiteral" && value.expressions.length === 0
+          ? (value.quasis[0]?.value.cooked ?? value.quasis[0]?.value.raw)
+          : undefined;
+    const usesHashTemplate = staticValue !== undefined && /\[hash(?::[^\]]*)?\]/i.test(staticValue);
     if (!hasNullishValue(generateScopedName) && !usesHashTemplate) return true;
     const indent = objectPropertyIndent(modulesObject, code);
     output.overwrite(
