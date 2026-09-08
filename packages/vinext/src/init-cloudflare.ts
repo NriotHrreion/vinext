@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import MagicString from "magic-string";
 import type { ESTree } from "vite";
 import type { CloudflareInitOptions } from "./init-platform.js";
+import { unwrapExpression } from "./plugins/ast-utils.js";
 import { detectProject } from "./utils/project.js";
 
 const require = createRequire(import.meta.url);
@@ -826,9 +827,8 @@ function hasPotentialSpreadOverride(object: AstObject, property: AstProperty | u
 }
 
 function unwrapObject(expression: ESTree.Expression): AstObject | undefined {
-  if (expression.type === "ObjectExpression") return expression as AstObject;
-  if (expression.type === "ParenthesizedExpression") return unwrapObject(expression.expression);
-  return undefined;
+  const unwrapped = unwrapExpression(expression);
+  return unwrapped?.type === "ObjectExpression" ? (unwrapped as AstObject) : undefined;
 }
 
 function findVariableObject(program: ESTree.Program, name: string): AstObject | undefined {
@@ -987,10 +987,17 @@ function findImportedBinding(
   imported: string,
 ): string | undefined {
   for (const statement of program.body) {
-    if (statement.type !== "ImportDeclaration" || statement.source.value !== source) continue;
+    if (
+      statement.type !== "ImportDeclaration" ||
+      statement.importKind === "type" ||
+      statement.source.value !== source
+    ) {
+      continue;
+    }
     for (const specifier of statement.specifiers) {
       if (
         specifier.type === "ImportSpecifier" &&
+        specifier.importKind !== "type" &&
         specifier.imported.type === "Identifier" &&
         specifier.imported.name === imported
       ) {
@@ -1003,7 +1010,13 @@ function findImportedBinding(
 
 function findNamespaceImportedBinding(program: ESTree.Program, source: string): string | undefined {
   for (const statement of program.body) {
-    if (statement.type !== "ImportDeclaration" || statement.source.value !== source) continue;
+    if (
+      statement.type !== "ImportDeclaration" ||
+      statement.importKind === "type" ||
+      statement.source.value !== source
+    ) {
+      continue;
+    }
     const namespace = statement.specifiers.find(
       (specifier): specifier is ESTree.ImportNamespaceSpecifier =>
         specifier.type === "ImportNamespaceSpecifier",
@@ -1025,7 +1038,9 @@ function ensureNamedImport(
 
   const declaration = program.body.find(
     (statement): statement is ESTree.ImportDeclaration =>
-      statement.type === "ImportDeclaration" && statement.source.value === source,
+      statement.type === "ImportDeclaration" &&
+      statement.importKind !== "type" &&
+      statement.source.value === source,
   );
   if (declaration) {
     const named = declaration.specifiers.filter(
@@ -1053,7 +1068,9 @@ function ensureDefaultImport(
 ): string {
   const declaration = program.body.find(
     (statement): statement is ESTree.ImportDeclaration =>
-      statement.type === "ImportDeclaration" && statement.source.value === source,
+      statement.type === "ImportDeclaration" &&
+      statement.importKind !== "type" &&
+      statement.source.value === source,
   );
   const existing = declaration?.specifiers.find(
     (specifier): specifier is ESTree.ImportDefaultSpecifier =>
@@ -1857,7 +1874,7 @@ export function updateViteConfigForCssModules(
         : secondProgram.body
             .filter(
               (statement): statement is ESTree.ImportDeclaration =>
-                statement.type === "ImportDeclaration",
+                statement.type === "ImportDeclaration" && statement.importKind !== "type",
             )
             .find((statement) => statement.source.value === "node:path")
             ?.specifiers.find(

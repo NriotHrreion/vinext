@@ -92,6 +92,39 @@ export default { plugins: [cssModules.patchCssModules({ generateSourceTypes: tru
     expect(result.code).toContain("generateScopedName(name, filename)");
   });
 
+  it("does not reuse type-only imports as runtime bindings", () => {
+    const input = `import type { patchCssModules } from "vite-css-modules";
+import { type createHash } from "node:crypto";
+import type path from "node:path";
+export default { plugins: [] } satisfies UserConfig;
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain(
+      'import { patchCssModules as patchCssModules2 } from "vite-css-modules"',
+    );
+    expect(result.code).toContain("type createHash, createHash as createHash2");
+    expect(result.code).toContain('import path2 from "node:path"');
+    expect(result.code).toContain('plugins: [patchCssModules2({ exportMode: "default" })]');
+    expect(result.code).toContain('const hash = createHash2("sha256")');
+    expect(result.code).toContain("const relativePath = path2");
+  });
+
+  it.each([
+    ["satisfies", "{ plugins: [] } satisfies UserConfig"],
+    ["as", "{ plugins: [] } as UserConfig"],
+    ["type assertion", "<UserConfig>{ plugins: [] }"],
+    ["non-null assertion", "{ plugins: [] }!"],
+  ])("unwraps a config object behind a TypeScript $0 expression", (_name, config) => {
+    const result = updateViteConfigForCssModules("vite.config.ts", `export default ${config};\n`);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain('plugins: [patchCssModules({ exportMode: "default" })]');
+    expect(result.code).toContain("generateScopedName(name, filename)");
+  });
+
   it("preserves an existing generateScopedName", () => {
     const input = `export default {
   plugins: [],
