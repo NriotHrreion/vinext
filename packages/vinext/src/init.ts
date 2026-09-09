@@ -264,7 +264,7 @@ export function getInitDependencyGroups(
     dependencies.push("@vinext/cloudflare");
     devDependencies.push("@cloudflare/vite-plugin", "wrangler");
   }
-  if (hasCssModules) devDependencies.push("vite-css-modules");
+  if (hasCssModules) devDependencies.push("vite-css-modules", "postcss");
   return { dependencies, devDependencies };
 }
 

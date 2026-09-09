@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import MagicString from "magic-string";
 import type { ESTree } from "vite";
 import type { CloudflareInitOptions } from "./init-platform.js";
-import { unwrapExpression } from "./plugins/ast-utils.js";
+import { forEachAstChild, unwrapExpression } from "./plugins/ast-utils.js";
 import { detectProject } from "./utils/project.js";
 
 const require = createRequire(import.meta.url);
@@ -947,6 +947,9 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
       }
       const direct = unwrapObject(expression.right);
       if (direct) return direct;
+      if (expression.right.type === "Identifier") {
+        return findVariableObject(program, expression.right.name);
+      }
       if (
         expression.right.type === "CallExpression" &&
         isDefineConfigCall(program, expression.right) &&
@@ -1037,7 +1040,7 @@ function collectPatternBindings(pattern: ESTree.Node, bindings: Set<string>): vo
   }
 }
 
-function collectTopLevelBindings(program: ESTree.Program): Set<string> {
+function collectAllBindings(program: ESTree.Program): Set<string> {
   const bindings = new Set<string>();
   for (const statement of program.body) {
     if (statement.type === "ImportDeclaration") {
@@ -1062,7 +1065,40 @@ function collectTopLevelBindings(program: ESTree.Program): Set<string> {
       bindings.add(declaration.id.name);
     }
   }
+  const collectNestedBindings = (node: ESTree.Node): void => {
+    if (node.type === "VariableDeclarator") {
+      collectPatternBindings(node.id, bindings);
+    } else if (
+      node.type === "FunctionDeclaration" ||
+      node.type === "FunctionExpression" ||
+      node.type === "ArrowFunctionExpression"
+    ) {
+      if (node.type !== "ArrowFunctionExpression" && node.id) bindings.add(node.id.name);
+      for (const parameter of node.params) collectPatternBindings(parameter, bindings);
+    } else if (node.type === "ClassExpression" && node.id) {
+      bindings.add(node.id.name);
+    } else if (node.type === "CatchClause" && node.param) {
+      collectPatternBindings(node.param, bindings);
+    } else if (node.type === "TSImportEqualsDeclaration") {
+      bindings.add(node.id.name);
+    }
+    forEachAstChild(node, collectNestedBindings);
+  };
+  forEachAstChild(program, collectNestedBindings);
   return bindings;
+}
+
+function overwritePropertyValue(
+  output: MagicString,
+  property: AstProperty,
+  name: string,
+  value: string,
+): void {
+  if (property.shorthand) {
+    output.overwrite((property as AstNode).start, (property as AstNode).end, `${name}: ${value}`);
+  } else {
+    output.overwrite((property.value as AstNode).start, (property.value as AstNode).end, value);
+  }
 }
 
 function allocateBinding(bindings: Set<string>, preferred: string): string {
@@ -1837,9 +1873,10 @@ function ensureCssModulesScopedName(
   if (css.value.type !== "ObjectExpression") {
     if (force) {
       const indent = objectPropertyIndent(config, code);
-      output.overwrite(
-        (css.value as AstNode).start,
-        (css.value as AstNode).end,
+      overwritePropertyValue(
+        output,
+        css,
+        "css",
         `{\n${indent}  modules: {\n${generateScopedNameSource(
           `${indent}    `,
         )},\n${indent}  },\n${indent}}`,
@@ -1871,9 +1908,10 @@ function ensureCssModulesScopedName(
   if (modules.value.type !== "ObjectExpression") {
     if (force) {
       const indent = objectPropertyIndent(cssObject, code);
-      output.overwrite(
-        (modules.value as AstNode).start,
-        (modules.value as AstNode).end,
+      overwritePropertyValue(
+        output,
+        modules,
+        "modules",
         `{\n${generateScopedNameSource(`${indent}  `)},\n${indent}}`,
       );
       return false;
@@ -1932,7 +1970,7 @@ export function updateViteConfigForCssModules(
     );
   }
   const commonJs = usesCommonJsViteConfig(filePath, code);
-  const bindings = collectTopLevelBindings(firstProgram);
+  const bindings = collectAllBindings(firstProgram);
   const firstOutput = new MagicString(code);
 
   const patchNamespace = commonJs
@@ -1978,7 +2016,7 @@ export function updateViteConfigForCssModules(
   const withPlugin = firstOutput.toString();
   const secondProgram = parseViteConfig(filePath, withPlugin);
   const secondConfig = findConfigObject(secondProgram)!;
-  const secondBindings = collectTopLevelBindings(secondProgram);
+  const secondBindings = collectAllBindings(secondProgram);
   const secondOutput = new MagicString(withPlugin);
   const preservedExistingGenerateScopedName = ensureCssModulesScopedName(
     secondOutput,
@@ -2120,7 +2158,7 @@ export function updateViteConfigForCloudflare(
 
   const output = new MagicString(code);
   const commonJs = usesCommonJsViteConfig(filePath, code);
-  const bindings = collectTopLevelBindings(program);
+  const bindings = collectAllBindings(program);
   const existingVinextBinding = commonJs
     ? findRequiredBinding(program, "vinext", "default")
     : program.body

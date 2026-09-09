@@ -222,6 +222,35 @@ module.exports = defineConfig(options);
     expect(result.code).toContain("generateScopedName(name, filename)");
   });
 
+  it("resolves a direct CommonJS identifier export", () => {
+    const input = `const config = { plugins: [] };
+module.exports = config;
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.cjs", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain('plugins: [patchCssModules({ exportMode: "default" })]');
+    expect(result.code).toContain("generateScopedName(name, filename)");
+  });
+
+  it("avoids callback-local binding collisions", () => {
+    const input = `import { defineConfig } from "vite";
+export default defineConfig((patchCssModules) => {
+  const path = "user-path";
+  const createHash = "user-hash";
+  return { plugins: [] };
+});
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain("patchCssModules2({");
+    expect(result.code).toContain("const relativePath = path2");
+    expect(result.code).toContain('createHash2("sha256")');
+  });
+
   it("recognizes a namespace-imported defineConfig call", () => {
     const input = `import * as vite from "vite";
 const options = { plugins: [] };
@@ -411,6 +440,16 @@ export default defineConfig({
         "export default { plugins: [], css: { modules: getModules() } };",
       ),
     ).toThrow("css.modules option must be a static object");
+  });
+
+  it.each([
+    ["css", "const css = getCss();\nexport default { plugins: [], css };"],
+    ["modules", "const modules = getModules();\nexport default { plugins: [], css: { modules } };"],
+  ])("keeps forced shorthand %s replacement syntactically valid", (_name, input) => {
+    const result = updateViteConfigForCssModules("vite.config.ts", input, true);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain("generateScopedName(name: string, filename: string)");
   });
 
   it.each([

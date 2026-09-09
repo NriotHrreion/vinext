@@ -442,7 +442,9 @@ describe("getInitDeps", () => {
 
   it("adds vite-css-modules only when CSS Modules are detected", () => {
     expect(getInitDeps(false, "node", true)).toContain("vite-css-modules");
+    expect(getInitDeps(false, "node", true)).toContain("postcss");
     expect(getInitDeps(false, "node", false)).not.toContain("vite-css-modules");
+    expect(getInitDeps(false, "node", false)).not.toContain("postcss");
   });
 });
 
@@ -1223,6 +1225,7 @@ describe("init — dependency installation", () => {
     const { result, execCalls, output } = await runInit(tmpDir, { platform: "node" });
 
     expect(result.installedDeps).toContain("vite-css-modules");
+    expect(result.installedDeps).toContain("postcss");
     expect(execCalls.some(({ cmd }) => cmd.includes("vite-css-modules"))).toBe(true);
     const config = readFile(tmpDir, "vite.config.ts");
     const patchCall = 'patchCssModules({ exportMode: "default" })';
