@@ -276,6 +276,42 @@ export default defineConfig((patchCssModules) => {
     expect(result.code).toContain('createHash2("sha256")');
   });
 
+  it.each([
+    [
+      "ES module imports",
+      `import { defineConfig } from "vite";
+import { patchCssModules } from "vite-css-modules";
+import { createHash } from "node:crypto";
+import path from "node:path";
+export default defineConfig((patchCssModules, createHash, path) => ({ plugins: [] }));
+`,
+      "vite.config.ts",
+    ],
+    [
+      "CommonJS requires",
+      `const { defineConfig } = require("vite");
+const { patchCssModules } = require("vite-css-modules");
+const { createHash } = require("node:crypto");
+const path = require("node:path");
+module.exports = defineConfig((patchCssModules, createHash, path) => ({ plugins: [] }));
+`,
+      "vite.config.cjs",
+    ],
+  ])("aliases $s shadowed by config callback bindings", (_name, input, fileName) => {
+    const result = updateViteConfigForCssModules(fileName, input);
+    const repeated = updateViteConfigForCssModules(fileName, result.code);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain("const patchCssModules2 = patchCssModules;");
+    expect(result.code).toContain("const createHash2 = createHash;");
+    expect(result.code).toContain("const path2 = path;");
+    expect(result.code).toContain('patchCssModules2({ exportMode: "default" })');
+    expect(result.code).toContain('createHash2("sha256")');
+    expect(result.code).toMatch(/path2\s*\.relative\(/);
+    expect(repeated.code).toBe(result.code);
+    expect(repeated.changed).toBe(false);
+  });
+
   it("recognizes a namespace-imported defineConfig call", () => {
     const input = `import * as vite from "vite";
 const options = { plugins: [] };

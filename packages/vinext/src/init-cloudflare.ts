@@ -773,6 +773,7 @@ ${cssModulesPlugin}    ${vinextExpression(
 type AstNode = ESTree.Node & { start: number; end: number };
 type AstObject = ESTree.ObjectExpression & AstNode;
 type AstProperty = Extract<AstObject["properties"][number], { type: "Property" }>;
+const configObjectLocalBindings = new WeakMap<AstObject, Set<string>>();
 
 function parseViteConfig(filePath: string, code: string): ESTree.Program {
   let parseSync: typeof import("vite").parseSync;
@@ -889,11 +890,37 @@ function findCallbackObject(expression: ESTree.Expression): AstObject | undefine
     return undefined;
   }
   if (!callback.body) return undefined;
-  if (callback.body.type !== "BlockStatement") return unwrapObject(callback.body);
-  const returnStatement = callback.body.body.find(
-    (statement): statement is ESTree.ReturnStatement => statement.type === "ReturnStatement",
-  );
-  return returnStatement?.argument ? unwrapObject(returnStatement.argument) : undefined;
+  const object =
+    callback.body.type !== "BlockStatement"
+      ? unwrapObject(callback.body)
+      : (() => {
+          const returnStatement = callback.body.body.find(
+            (statement): statement is ESTree.ReturnStatement =>
+              statement.type === "ReturnStatement",
+          );
+          return returnStatement?.argument ? unwrapObject(returnStatement.argument) : undefined;
+        })();
+  if (!object) return undefined;
+
+  const bindings = new Set<string>();
+  if (callback.type === "FunctionExpression" && callback.id) bindings.add(callback.id.name);
+  for (const parameter of callback.params) collectPatternBindings(parameter, bindings);
+  if (callback.body.type === "BlockStatement") {
+    for (const statement of callback.body.body) {
+      if (statement.type === "VariableDeclaration") {
+        for (const declaration of statement.declarations) {
+          collectPatternBindings(declaration.id, bindings);
+        }
+      } else if (
+        (statement.type === "FunctionDeclaration" || statement.type === "ClassDeclaration") &&
+        statement.id
+      ) {
+        bindings.add(statement.id.name);
+      }
+    }
+  }
+  configObjectLocalBindings.set(object, bindings);
+  return object;
 }
 
 function findVariableObject(
@@ -1088,6 +1115,10 @@ function collectAllBindings(program: ESTree.Program): Set<string> {
   };
   forEachAstChild(program, collectNestedBindings);
   return bindings;
+}
+
+function hasLocalBindingAtObject(object: AstObject, name: string): boolean {
+  return configObjectLocalBindings.get(object)?.has(name) ?? false;
 }
 
 function overwritePropertyValue(
@@ -1292,6 +1323,34 @@ function ensureDefaultRequire(
   const sourceText = `const ${binding} = require(${JSON.stringify(source)});`;
   output.appendLeft(offset, offset === 0 ? `${sourceText}\n` : `\n${sourceText}`);
   return binding;
+}
+
+function aliasShadowedBinding(
+  program: ESTree.Program,
+  output: MagicString,
+  config: AstObject,
+  bindings: Set<string>,
+  binding: string,
+  commonJs: boolean,
+): string {
+  if (!hasLocalBindingAtObject(config, binding)) return binding;
+  for (const statement of program.body) {
+    if (statement.type !== "VariableDeclaration") continue;
+    for (const declaration of statement.declarations) {
+      if (
+        declaration.id.type === "Identifier" &&
+        declaration.init?.type === "Identifier" &&
+        declaration.init.name === binding &&
+        !hasLocalBindingAtObject(config, declaration.id.name)
+      ) {
+        return declaration.id.name;
+      }
+    }
+  }
+  const alias = allocateBinding(bindings, binding);
+  const offset = commonJs ? requireInsertionOffset(program) : importInsertionOffset(program);
+  output.appendLeft(offset, `\nconst ${alias} = ${binding};`);
+  return alias;
 }
 
 function insertObjectProperty(
@@ -1990,22 +2049,30 @@ export function updateViteConfigForCssModules(
       );
     }
   } else {
-    const patchLocal = existingPatch ?? allocateBinding(bindings, "patchCssModules");
-    const patchBinding = commonJs
-      ? ensureNamedRequire(
+    const patchBinding = existingPatch
+      ? aliasShadowedBinding(
           firstProgram,
           firstOutput,
-          "vite-css-modules",
-          "patchCssModules",
-          patchLocal,
+          firstConfig,
+          bindings,
+          existingPatch,
+          commonJs,
         )
-      : ensureNamedImport(
-          firstProgram,
-          firstOutput,
-          "vite-css-modules",
-          "patchCssModules",
-          patchLocal,
-        );
+      : commonJs
+        ? ensureNamedRequire(
+            firstProgram,
+            firstOutput,
+            "vite-css-modules",
+            "patchCssModules",
+            allocateBinding(bindings, "patchCssModules"),
+          )
+        : ensureNamedImport(
+            firstProgram,
+            firstOutput,
+            "vite-css-modules",
+            "patchCssModules",
+            allocateBinding(bindings, "patchCssModules"),
+          );
     ensurePluginFirst(
       firstOutput,
       firstConfig,
@@ -2028,22 +2095,30 @@ export function updateViteConfigForCssModules(
       const existingCreateHash = commonJs
         ? findRequiredBinding(secondProgram, "node:crypto", "createHash")
         : findImportedBinding(secondProgram, "node:crypto", "createHash");
-      const createHashLocal = existingCreateHash ?? allocateBinding(secondBindings, "createHash");
-      const createHashBinding = commonJs
-        ? ensureNamedRequire(
+      const createHashBinding = existingCreateHash
+        ? aliasShadowedBinding(
             secondProgram,
             secondOutput,
-            "node:crypto",
-            "createHash",
-            createHashLocal,
+            secondConfig,
+            secondBindings,
+            existingCreateHash,
+            commonJs,
           )
-        : ensureNamedImport(
-            secondProgram,
-            secondOutput,
-            "node:crypto",
-            "createHash",
-            createHashLocal,
-          );
+        : commonJs
+          ? ensureNamedRequire(
+              secondProgram,
+              secondOutput,
+              "node:crypto",
+              "createHash",
+              allocateBinding(secondBindings, "createHash"),
+            )
+          : ensureNamedImport(
+              secondProgram,
+              secondOutput,
+              "node:crypto",
+              "createHash",
+              allocateBinding(secondBindings, "createHash"),
+            );
       const existingPath = commonJs
         ? findRequiredBinding(secondProgram, "node:path", "default")
         : secondProgram.body
@@ -2056,10 +2131,28 @@ export function updateViteConfigForCssModules(
               (specifier): specifier is ESTree.ImportDefaultSpecifier =>
                 specifier.type === "ImportDefaultSpecifier",
             )?.local.name;
-      const pathLocal = existingPath ?? allocateBinding(secondBindings, "path");
-      const pathBinding = commonJs
-        ? ensureDefaultRequire(secondProgram, secondOutput, "node:path", pathLocal)
-        : ensureDefaultImport(secondProgram, secondOutput, "node:path", pathLocal);
+      const pathBinding = existingPath
+        ? aliasShadowedBinding(
+            secondProgram,
+            secondOutput,
+            secondConfig,
+            secondBindings,
+            existingPath,
+            commonJs,
+          )
+        : commonJs
+          ? ensureDefaultRequire(
+              secondProgram,
+              secondOutput,
+              "node:path",
+              allocateBinding(secondBindings, "path"),
+            )
+          : ensureDefaultImport(
+              secondProgram,
+              secondOutput,
+              "node:path",
+              allocateBinding(secondBindings, "path"),
+            );
       return generateScopedNameMethodSource(
         indent,
         pathBinding,
