@@ -159,7 +159,8 @@ export default defineConfig({
 }
 
 const CSS_MODULE_PATTERN = /\.module\.(?:css|scss|sass)$/;
-const CSS_MODULE_SCAN_IGNORES = new Set(["node_modules", ".next", ".vinext", ".wrangler"]);
+const CSS_MODULE_GLOBS = ["**/*.module.{css,scss,sass}", "**/.*/**/*.module.{css,scss,sass}"];
+const CSS_MODULE_SCAN_IGNORES = new Set(["node_modules", ".git", ".next", ".vinext", ".wrangler"]);
 const CSS_MODULE_ROOT_SCAN_IGNORES = new Set(["dist", "out", "build", "coverage"]);
 
 /** Detect project-owned CSS, SCSS, or Sass module files. */
@@ -167,13 +168,12 @@ export function scanCssModuleFiles(root: string): boolean {
   try {
     const canonicalRoot = path.resolve(root);
     return fs
-      .globSync("**/*.module.{css,scss,sass}", {
+      .globSync(CSS_MODULE_GLOBS, {
         cwd: root,
         withFileTypes: true,
         exclude: (entry) =>
           entry.isDirectory() &&
-          (entry.name.startsWith(".") ||
-            CSS_MODULE_SCAN_IGNORES.has(entry.name) ||
+          (CSS_MODULE_SCAN_IGNORES.has(entry.name) ||
             (toSlash(entry.parentPath) === canonicalRoot &&
               CSS_MODULE_ROOT_SCAN_IGNORES.has(entry.name))),
       })

@@ -883,6 +883,19 @@ function isDefineConfigCall(program: ESTree.Program, call: ESTree.CallExpression
   );
 }
 
+function findCallbackObject(expression: ESTree.Expression): AstObject | undefined {
+  const callback = unwrapExpression(expression);
+  if (callback?.type !== "ArrowFunctionExpression" && callback?.type !== "FunctionExpression") {
+    return undefined;
+  }
+  if (!callback.body) return undefined;
+  if (callback.body.type !== "BlockStatement") return unwrapObject(callback.body);
+  const returnStatement = callback.body.body.find(
+    (statement): statement is ESTree.ReturnStatement => statement.type === "ReturnStatement",
+  );
+  return returnStatement?.argument ? unwrapObject(returnStatement.argument) : undefined;
+}
+
 function findVariableObject(
   program: ESTree.Program,
   name: string,
@@ -920,7 +933,7 @@ function findVariableObject(
       if (firstArgument.type === "Identifier") {
         return findVariableObject(program, firstArgument.name, seen);
       }
-      return undefined;
+      return findCallbackObject(firstArgument);
     }
   }
   return undefined;
@@ -962,6 +975,7 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
         if (firstArgument.type === "Identifier") {
           return findVariableObject(program, firstArgument.name);
         }
+        return findCallbackObject(firstArgument);
       }
     }
     return undefined;
@@ -990,19 +1004,7 @@ function findConfigObject(program: ESTree.Program): AstObject | undefined {
   if (firstArgument.type === "Identifier") {
     return findVariableObject(program, firstArgument.name);
   }
-  if (
-    firstArgument.type !== "ArrowFunctionExpression" &&
-    firstArgument.type !== "FunctionExpression"
-  ) {
-    return undefined;
-  }
-
-  if (!firstArgument.body) return undefined;
-  if (firstArgument.body.type !== "BlockStatement") return unwrapObject(firstArgument.body);
-  const returnStatement = firstArgument.body.body.find(
-    (statement): statement is ESTree.ReturnStatement => statement.type === "ReturnStatement",
-  );
-  return returnStatement?.argument ? unwrapObject(returnStatement.argument) : undefined;
+  return findCallbackObject(firstArgument);
 }
 
 function importInsertionOffset(program: ESTree.Program): number {

@@ -295,6 +295,11 @@ describe("scanCssModuleFiles", () => {
     writeFile(tmpDir, "app/build/components/card.module.css", ".card {}");
     expect(scanCssModuleFiles(tmpDir)).toBe(true);
   });
+
+  it("detects CSS Modules in project-owned hidden source directories", () => {
+    writeFile(tmpDir, "components/.internal/card.module.css", ".card {}");
+    expect(scanCssModuleFiles(tmpDir)).toBe(true);
+  });
 });
 
 // ─── Unit Tests: addScripts ──────────────────────────────────────────────────

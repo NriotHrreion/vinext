@@ -222,6 +222,31 @@ module.exports = defineConfig(options);
     expect(result.code).toContain("generateScopedName(name, filename)");
   });
 
+  it.each([
+    [
+      "ES module",
+      `import { defineConfig } from "vite";
+const config = defineConfig(() => ({ plugins: [] }));
+export default config;
+`,
+      "vite.config.ts",
+    ],
+    [
+      "CommonJS",
+      `const { defineConfig } = require("vite");
+const config = defineConfig(() => ({ plugins: [] }));
+module.exports = config;
+`,
+      "vite.config.cjs",
+    ],
+  ])("resolves a callback in a variable-bound $s defineConfig call", (_name, input, fileName) => {
+    const result = updateViteConfigForCssModules(fileName, input);
+
+    expectValidConfig(result.code);
+    expect(result.code).toContain('plugins: [patchCssModules({ exportMode: "default" })]');
+    expect(result.code).toContain("generateScopedName(name");
+  });
+
   it("resolves a direct CommonJS identifier export", () => {
     const input = `const config = { plugins: [] };
 module.exports = config;
