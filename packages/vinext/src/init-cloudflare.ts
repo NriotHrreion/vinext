@@ -1348,7 +1348,21 @@ function aliasShadowedBinding(
     }
   }
   const alias = allocateBinding(bindings, binding);
-  const offset = commonJs ? requireInsertionOffset(program) : importInsertionOffset(program);
+  let offset = importInsertionOffset(program);
+  if (commonJs) {
+    offset = requireInsertionOffset(program);
+    for (const statement of program.body) {
+      if (statement.type !== "VariableDeclaration") continue;
+      const statementBindings = new Set<string>();
+      for (const declaration of statement.declarations) {
+        collectPatternBindings(declaration.id, statementBindings);
+      }
+      if (statementBindings.has(binding)) {
+        offset = (statement as AstNode).end;
+        break;
+      }
+    }
+  }
   output.appendLeft(offset, `\nconst ${alias} = ${binding};`);
   return alias;
 }

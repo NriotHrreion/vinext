@@ -289,7 +289,8 @@ export default defineConfig((patchCssModules, createHash, path) => ({ plugins: [
     ],
     [
       "CommonJS requires",
-      `const { defineConfig } = require("vite");
+      `"use strict";
+const { defineConfig } = require("vite");
 const { patchCssModules } = require("vite-css-modules");
 const { createHash } = require("node:crypto");
 const path = require("node:path");
@@ -308,6 +309,17 @@ module.exports = defineConfig((patchCssModules, createHash, path) => ({ plugins:
     expect(result.code).toContain('patchCssModules2({ exportMode: "default" })');
     expect(result.code).toContain('createHash2("sha256")');
     expect(result.code).toMatch(/path2\s*\.relative\(/);
+    if (fileName.endsWith(".cjs")) {
+      expect(result.code.indexOf("const patchCssModules2")).toBeGreaterThan(
+        result.code.indexOf('require("vite-css-modules")'),
+      );
+      expect(result.code.indexOf("const createHash2")).toBeGreaterThan(
+        result.code.indexOf('require("node:crypto")'),
+      );
+      expect(result.code.indexOf("const path2")).toBeGreaterThan(
+        result.code.indexOf('require("node:path")'),
+      );
+    }
     expect(repeated.code).toBe(result.code);
     expect(repeated.changed).toBe(false);
   });
