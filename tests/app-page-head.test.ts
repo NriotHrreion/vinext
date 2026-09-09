@@ -1152,6 +1152,29 @@ describe("app page head resolution", () => {
     expect(result.metadata?.title).toBe("Slot page");
   });
 
+  it("retains a primary leaf template when later parallel metadata items follow it", async () => {
+    const result = await resolveAppPageHead<Record<string, unknown>>({
+      layoutModules: [
+        {},
+        { metadata: { title: { default: "Dashboard", template: "%s | Dashboard" } } },
+      ],
+      layoutTreePositions: [0, 1],
+      metadataRoutes: [],
+      pageModule: {},
+      parallelRoutes: [
+        {
+          pageModule: { metadata: { title: "Modal" } },
+          routeSegments: ["foo"],
+        },
+      ],
+      params: {},
+      routePath: "/foo",
+      routeSegments: ["foo"],
+    });
+
+    expect(result.metadata?.title).toBe("Modal | Dashboard");
+  });
+
   it("uses parallel layout title when neither primary page nor slot page set a title", async () => {
     // Ported from Next.js: test/e2e/app-dir/metadata-streaming-parallel-routes/metadata-streaming-parallel-routes.test.ts
     //
