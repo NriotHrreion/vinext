@@ -170,7 +170,7 @@ type AppPageSearchParamsCollection = {
 };
 
 type ResolvedParallelRouteMetadata = {
-  metadataResults: (Metadata | null)[];
+  metadataEntries: MetadataMergeEntry[];
   metadataSources: AppPageHeadSource[];
 };
 
@@ -505,7 +505,7 @@ async function resolveParallelRouteMetadata<TModule extends AppPageHeadModule>(
 ): Promise<ResolvedParallelRouteMetadata> {
   const params = parallelRoute.params ?? fallbackParams;
   const routeSegments = parallelRoute.routeSegments ?? fallbackRouteSegments;
-  const metadataResults: (Metadata | null)[] = [];
+  const metadataEntries: MetadataMergeEntry[] = [];
   const metadataSources: AppPageHeadSource[] = [];
   let accumulatedMetadata = parent;
   const layoutModules = getParallelRouteModules(parallelRoute);
@@ -522,7 +522,17 @@ async function resolveParallelRouteMetadata<TModule extends AppPageHeadModule>(
       undefined,
       accumulatedMetadata,
     );
-    metadataResults.push(layoutMetadata);
+    if (layoutMetadata) {
+      const isSameLayerAsPage =
+        parallelRoute.pageModule != null &&
+        parallelRoute.routeSegments != null &&
+        parallelRoute.layoutTreePositions != null &&
+        layoutTreePositions[index] === routeSegments.length;
+      metadataEntries.push({
+        metadata: layoutMetadata,
+        ...(isSameLayerAsPage ? { stashesTitleTemplate: false } : {}),
+      });
+    }
     // Parallel route metadata sources are scoped to the active slot branch because
     // the route tree input does not carry per-layout segment positions inside that branch.
     metadataSources.push({ metadata: layoutMetadata, routeSegments });
@@ -543,12 +553,12 @@ async function resolveParallelRouteMetadata<TModule extends AppPageHeadModule>(
       accumulatedMetadata,
       searchParamsObserver,
     );
-    metadataResults.push(pageMetadata);
+    if (pageMetadata) metadataEntries.push({ metadata: pageMetadata });
     // Keep the page source scoped to the same active slot branch as its layouts.
     metadataSources.push({ metadata: pageMetadata, routeSegments });
   }
 
-  return { metadataResults, metadataSources };
+  return { metadataEntries, metadataSources };
 }
 
 function resolveParallelRouteViewport<TModule extends AppPageHeadModule>(
@@ -761,7 +771,7 @@ function prepareAppPageHeadInner<TModule extends AppPageHeadModule>(
     pageMetadataPromise,
     parallelRouteMetadataPromise,
   ]).then(async ([layoutMetadataResults, pageMetadata, parallelRouteMetadata]) => {
-    const parallelMetadataResults = parallelRouteMetadata.flatMap((head) => head.metadataResults);
+    const parallelMetadataEntries = parallelRouteMetadata.flatMap((head) => head.metadataEntries);
     const parallelMetadataSources = parallelRouteMetadata.flatMap((head) => head.metadataSources);
 
     // Active parallel slot metadata is suppressed from contributing the primary
@@ -793,9 +803,10 @@ function prepareAppPageHeadInner<TModule extends AppPageHeadModule>(
         ];
       }),
       ...(pageMetadata ? [{ isPage: true, metadata: pageMetadata }] : []),
-      ...parallelMetadataResults
-        .filter(isPresent)
-        .map((entry) => ({ contributesTitle: !primaryPageHasTitle, metadata: entry })),
+      ...parallelMetadataEntries.map((entry) => ({
+        ...entry,
+        contributesTitle: !primaryPageHasTitle,
+      })),
     ];
 
     const resolvedMetadataBase =

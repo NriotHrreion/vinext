@@ -1128,6 +1128,30 @@ describe("app page head resolution", () => {
     expect(result.metadata?.title).toBe("first page - @bar");
   });
 
+  it("does not apply a parallel leaf layout title template to its same-layer page", async () => {
+    // Matches Next.js's leaf layout/page title-template handling inside an active slot:
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/lib/metadata/resolve-metadata.ts
+    const result = await resolveAppPageHead<Record<string, unknown>>({
+      layoutModules: [],
+      layoutTreePositions: [],
+      metadataRoutes: [],
+      pageModule: {},
+      parallelRoutes: [
+        {
+          layoutModules: [{ metadata: { title: { default: "Slot", template: "%s | Slot" } } }],
+          layoutTreePositions: [1],
+          pageModule: { metadata: { title: "Slot page" } },
+          routeSegments: ["foo"],
+        },
+      ],
+      params: {},
+      routePath: "/foo",
+      routeSegments: ["foo"],
+    });
+
+    expect(result.metadata?.title).toBe("Slot page");
+  });
+
   it("uses parallel layout title when neither primary page nor slot page set a title", async () => {
     // Ported from Next.js: test/e2e/app-dir/metadata-streaming-parallel-routes/metadata-streaming-parallel-routes.test.ts
     //
