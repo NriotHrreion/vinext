@@ -96,6 +96,18 @@ export default { plugins: [cssModules.patchCssModules({ generateSourceTypes: tru
     expect(result.code).toContain("generateScopedName(name: string, filename: string)");
   });
 
+  it("rejects an existing namespace plugin call that a later spread can override", () => {
+    const input = `import * as cssModules from "vite-css-modules";
+export default {
+  plugins: [cssModules.patchCssModules()],
+  ...sharedConfig,
+  css: { modules: {} },
+};
+`;
+
+    expect(() => updateViteConfigForCssModules("vite.config.ts", input)).toThrow(/spread/i);
+  });
+
   it("does not reuse type-only imports as runtime bindings", () => {
     const input = `import type { patchCssModules } from "vite-css-modules";
 import { type createHash } from "node:crypto";
@@ -473,6 +485,39 @@ export default {
     expect(result.code).toContain("plugins: [firstPlugin()]");
     expect(result.code).toContain(
       'plugins: [patchCssModules({ exportMode: "default" }), vinext()]',
+    );
+  });
+
+  it("updates statically computed config properties without duplicating them", () => {
+    const input = `import vinext from "vinext";
+export default {
+  ["plugins"]: [vinext()],
+  [\`css\`]: { ["modules"]: { localsConvention: "camelCase" } },
+};
+`;
+
+    const result = updateViteConfigForCssModules("vite.config.ts", input);
+
+    expectValidConfig(result.code);
+    expect(result.code.match(/plugins/g)).toHaveLength(1);
+    expect(result.code.match(/modules/g)).toHaveLength(2);
+    expect(result.code).toContain(
+      '["plugins"]: [patchCssModules({ exportMode: "default" }), vinext()]',
+    );
+    expect(result.code).toContain('localsConvention: "camelCase"');
+    expect(result.code).toContain("generateScopedName(name: string, filename: string)");
+  });
+
+  it("rejects dynamic computed config properties that could override the workaround", () => {
+    const input = `export default {
+  plugins: [],
+  css: { modules: {} },
+  [configKey]: sharedConfig,
+};
+`;
+
+    expect(() => updateViteConfigForCssModules("vite.config.ts", input)).toThrow(
+      /dynamic computed/i,
     );
   });
 

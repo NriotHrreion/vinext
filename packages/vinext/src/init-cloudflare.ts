@@ -800,10 +800,12 @@ function parseViteConfig(filePath: string, code: string): ESTree.Program {
 }
 
 function propertyName(property: AstProperty): string | undefined {
-  if (property.computed) return undefined;
-  if (property.key.type === "Identifier") return property.key.name;
+  if (!property.computed && property.key.type === "Identifier") return property.key.name;
   if (property.key.type === "Literal" && typeof property.key.value === "string") {
     return property.key.value;
+  }
+  if (property.key.type === "TemplateLiteral" && property.key.expressions.length === 0) {
+    return property.key.quasis[0]?.value.cooked ?? property.key.quasis[0]?.value.raw;
   }
   return undefined;
 }
@@ -832,14 +834,18 @@ function isNullishValue(value: ESTree.Node): boolean {
 }
 
 /**
- * A missing property may be supplied by any spread, while an existing property
- * may be overridden by a later spread because object composition is last-write-wins.
+ * A missing property may be supplied by any spread or dynamic computed key,
+ * while an existing property may be overridden by either one appearing later.
  */
 function hasPotentialSpreadOverride(object: AstObject, property: AstProperty | undefined): boolean {
   const propertyIndex = property ? object.properties.lastIndexOf(property) : -1;
   return object.properties
     .slice(propertyIndex + 1)
-    .some((candidate) => candidate.type === "SpreadElement");
+    .some(
+      (candidate) =>
+        candidate.type === "SpreadElement" ||
+        (candidate.type === "Property" && candidate.computed && !propertyName(candidate)),
+    );
 }
 
 function unwrapObject(expression: ESTree.Expression): AstObject | undefined {
@@ -1743,7 +1749,7 @@ function ensurePluginFirst(
   const plugins = findLastProperty(config, "plugins");
   if (hasPotentialSpreadOverride(config, plugins)) {
     throw new Error(
-      "The Vite config's plugins option must be explicitly defined after any spread properties so vinext init can configure CSS Modules without replacing existing plugins.",
+      "The Vite config's plugins option must be explicitly defined after any spread or dynamic computed properties so vinext init can configure CSS Modules without replacing existing plugins.",
     );
   }
   if (!plugins) {
@@ -1812,7 +1818,7 @@ function ensureCssModulesScopedName(
   const css = findLastProperty(config, "css");
   if (hasPotentialSpreadOverride(config, css)) {
     throw new Error(
-      "The Vite config's css option must be explicitly defined after any spread properties so vinext init can configure CSS Modules without replacing existing options.",
+      "The Vite config's css option must be explicitly defined after any spread or dynamic computed properties so vinext init can configure CSS Modules without replacing existing options.",
     );
   }
   if (!css) {
@@ -1848,7 +1854,7 @@ function ensureCssModulesScopedName(
   const modules = findLastProperty(cssObject, "modules");
   if (hasPotentialSpreadOverride(cssObject, modules)) {
     throw new Error(
-      "The Vite config's css.modules option must be explicitly defined after any spread properties so vinext init can configure CSS Modules without replacing existing options.",
+      "The Vite config's css.modules option must be explicitly defined after any spread or dynamic computed properties so vinext init can configure CSS Modules without replacing existing options.",
     );
   }
   if (!modules) {
@@ -1881,7 +1887,7 @@ function ensureCssModulesScopedName(
   if (generateScopedName) {
     if (hasPotentialSpreadOverride(modulesObject, generateScopedName)) {
       throw new Error(
-        "The Vite config's css.modules.generateScopedName option must appear after any spread properties so vinext init can verify it.",
+        "The Vite config's css.modules.generateScopedName option must appear after any spread or dynamic computed properties so vinext init can verify it.",
       );
     }
     const value = unwrapExpression(generateScopedName.value);
@@ -1936,7 +1942,14 @@ export function updateViteConfigForCssModules(
   const existingPatch = commonJs
     ? findRequiredBinding(firstProgram, "vite-css-modules", "patchCssModules")
     : findImportedBinding(firstProgram, "vite-css-modules", "patchCssModules");
-  if (!existingMemberCall) {
+  if (existingMemberCall) {
+    const plugins = findLastProperty(firstConfig, "plugins");
+    if (hasPotentialSpreadOverride(firstConfig, plugins)) {
+      throw new Error(
+        "The Vite config's plugins option must be explicitly defined after any spread or dynamic computed properties so vinext init can verify the existing CSS Modules plugin.",
+      );
+    }
+  } else {
     const patchLocal = existingPatch ?? allocateBinding(bindings, "patchCssModules");
     const patchBinding = commonJs
       ? ensureNamedRequire(
