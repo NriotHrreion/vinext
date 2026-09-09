@@ -300,6 +300,14 @@ describe("scanCssModuleFiles", () => {
     writeFile(tmpDir, "components/.internal/card.module.css", ".card {}");
     expect(scanCssModuleFiles(tmpDir)).toBe(true);
   });
+
+  it.each([".card.module.css", "components/.card.module.scss"])(
+    "detects a dot-prefixed CSS Module file at %s",
+    (file) => {
+      writeFile(tmpDir, file, ".card {}");
+      expect(scanCssModuleFiles(tmpDir)).toBe(true);
+    },
+  );
 });
 
 // ─── Unit Tests: addScripts ──────────────────────────────────────────────────

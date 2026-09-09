@@ -159,7 +159,12 @@ export default defineConfig({
 }
 
 const CSS_MODULE_PATTERN = /\.module\.(?:css|scss|sass)$/;
-const CSS_MODULE_GLOBS = ["**/*.module.{css,scss,sass}", "**/.*/**/*.module.{css,scss,sass}"];
+const CSS_MODULE_GLOBS = [
+  "**/*.module.{css,scss,sass}",
+  "**/.*.module.{css,scss,sass}",
+  "**/.*/**/*.module.{css,scss,sass}",
+  "**/.*/**/.*.module.{css,scss,sass}",
+];
 const CSS_MODULE_SCAN_IGNORES = new Set(["node_modules", ".git", ".next", ".vinext", ".wrangler"]);
 const CSS_MODULE_ROOT_SCAN_IGNORES = new Set(["dist", "out", "build", "coverage"]);
 
