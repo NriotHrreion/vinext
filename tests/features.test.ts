@@ -3047,6 +3047,25 @@ describe("MetadataHead rendering", () => {
     expect(html).not.toContain(imageUrl);
   });
 
+  // Matches Next.js's resolveUrl path composition for protocol-relative input:
+  // packages/next/src/lib/metadata/resolvers/resolve-url.ts
+  it("resolves protocol-relative social image URLs against metadataBase", () => {
+    const imageUrl = "//cdn.example/path/my image.webp";
+    const encodedImageUrl = "https://site.example/base/cdn.example/path/my%20image.webp";
+    const html = renderToStaticMarkup(
+      React.createElement(MetadataHead, {
+        metadata: {
+          metadataBase: new URL("https://site.example/base"),
+          openGraph: { images: [imageUrl] },
+          twitter: { images: [{ url: imageUrl }] },
+        },
+      }),
+    );
+
+    expect(html).toContain(`property="og:image" content="${encodedImageUrl}"`);
+    expect(html).toContain(`name="twitter:image" content="${encodedImageUrl}"`);
+  });
+
   it("normalizes root canonical metadataBase URLs without a trailing slash", () => {
     // Ported from Next.js: test/e2e/app-dir/metadata-dynamic-routes/index.test.ts
     // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata-dynamic-routes/index.test.ts

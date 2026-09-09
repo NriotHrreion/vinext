@@ -11,7 +11,7 @@ import type {
   Viewport as NextViewport,
 } from "@vinext/types/next/upstream/dist/lib/metadata/types/metadata-interface";
 import { makeThenableParams, type ThenableParamsObserver } from "./thenable-params.js";
-import { isAbsoluteOrProtocolRelativeUrl } from "./url-utils.js";
+import { isAbsoluteOrProtocolRelativeUrl, isAbsoluteUrl } from "./url-utils.js";
 
 const USE_CACHE_FUNCTION_SYMBOL = Symbol.for("vinext.useCacheFunction");
 const USE_CACHE_ACCEPTS_SECOND_ARGUMENT_SYMBOL = Symbol.for("vinext.useCacheAcceptsSecondArgument");
@@ -845,10 +845,12 @@ function resolveSocialImageUrl(
   }
 
   const metadataRoute = isSocialImageDescriptor(image) && isMetadataRouteSocialImage(image);
-  if (!isAbsoluteOrProtocolRelativeUrl(imageUrl) && (!metadataBase || metadataRoute)) {
-    return resolveMetadataUrl(imageUrl, getSocialImageMetadataBaseFallback(metadataBase));
-  }
-  return resolveMetadataUrl(imageUrl, metadataBase);
+  const base =
+    !isAbsoluteUrl(imageUrl) && (!metadataBase || metadataRoute)
+      ? getSocialImageMetadataBaseFallback(metadataBase)
+      : metadataBase;
+  // Next.js treats protocol-relative social images as relative paths.
+  return resolveMetadataUrl(imageUrl.replace(/^\/+/, "/"), base);
 }
 
 type MetadataHeadProps = {
