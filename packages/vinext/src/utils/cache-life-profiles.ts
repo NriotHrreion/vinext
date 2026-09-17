@@ -116,9 +116,17 @@ export function resolveCacheLifeProfiles(
   // Validate the explicit values first, then fill only an overridden default.
   // https://github.com/vercel/next.js/blob/f464e32ec092c5a00c967e64cba40121a2992224/packages/next/src/server/config.ts#L1441
   if (Object.hasOwn(cacheLife, "default")) {
-    resolved.default.stale ??= options.defaultStale ?? 300;
+    resolved.default.stale ??= normalizeCacheLifeValue(
+      "default",
+      "stale",
+      options.defaultStale ?? 300,
+    );
     resolved.default.revalidate ??= profiles.default.revalidate;
-    resolved.default.expire ??= options.defaultExpire ?? profiles.default.expire;
+    resolved.default.expire ??= normalizeCacheLifeValue(
+      "default",
+      "expire",
+      options.defaultExpire ?? profiles.default.expire,
+    );
   }
 
   return resolved;
