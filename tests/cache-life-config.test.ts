@@ -6,12 +6,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import vinext from "../packages/vinext/src/index.js";
 import type { NextConfigInput } from "../packages/vinext/src/config/next-config.js";
 import { createDirectRunner } from "../packages/vinext/src/server/dev-module-runner.js";
-import {
-  createDefaultCacheLifeProfiles,
-  type CacheLifeConfig,
-} from "../packages/vinext/src/utils/cache-life-profiles.js";
+import { createDefaultCacheLifeProfiles } from "../packages/vinext/src/utils/cache-life-profiles.js";
 
-type CacheModule = { cacheLifeProfiles: Record<string, CacheLifeConfig> };
+type CacheModule = typeof import("../packages/vinext/src/shims/cache.js");
+type CacheRuntime = typeof import("../packages/vinext/src/shims/cache-runtime.js");
 
 describe("configured cacheLife in dev environments", () => {
   const roots: string[] = [];
@@ -153,6 +151,34 @@ describe("configured cacheLife in dev environments", () => {
   it("uses built-in defaults for direct shim imports without Vite injection", async () => {
     const direct = await import("../packages/vinext/src/shims/cache.js");
     expect(direct.cacheLifeProfiles).toStrictEqual(createDefaultCacheLifeProfiles());
+  });
+
+  it("consumes the injected profiles consistently in real RSC and SSR dev execution", async () => {
+    for (const [index, cache] of [first.rsc, first.ssr, second.rsc, second.ssr].entries()) {
+      const runtime = await runners[index].import<CacheRuntime>(
+        path.resolve(import.meta.dirname, "../packages/vinext/src/shims/cache-runtime.ts"),
+      );
+      const cached = runtime.registerCachedFunction(async () => {
+        cache.cacheLife("hours");
+        return "configured";
+      }, `configured:dev:${index}`);
+      await cache._runWithCacheState(async () => {
+        expect(await cached()).toBe("configured");
+        expect(cache._peekRequestScopedCacheLife()).toStrictEqual(
+          index < 2
+            ? { stale: 300, revalidate: 30, expire: 120 }
+            : createDefaultCacheLifeProfiles().hours,
+        );
+      });
+      const blog = runtime.registerCachedFunction(async () => {
+        cache.cacheLife("blog");
+        return "blog";
+      }, `configured:dev:blog:${index}`);
+      await cache._runWithCacheState(async () => {
+        await blog();
+        expect(cache._peekRequestScopedCacheLife()).toStrictEqual(cache.cacheLifeProfiles.blog);
+      });
+    }
   });
 
   it("does not publish application configuration into the host process environment", () => {

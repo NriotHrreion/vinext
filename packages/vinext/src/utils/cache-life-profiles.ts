@@ -23,6 +23,20 @@ export function createDefaultCacheLifeProfiles(): Record<string, CacheLifeConfig
   return structuredClone(builtInCacheLifeProfiles);
 }
 
+/** Fill omitted durations only when a consumer has resolved its explicit values. */
+export function fillCacheLifeDefaults(
+  profile: CacheLifeConfig,
+  defaultProfile: CacheLifeConfig,
+): CacheLifeConfig {
+  const resolved = { ...profile };
+  for (const key of ["stale", "revalidate", "expire"] as const) {
+    if (resolved[key] === undefined && defaultProfile[key] !== undefined) {
+      resolved[key] = defaultProfile[key];
+    }
+  }
+  return resolved;
+}
+
 // Matches Next.js's validateAndNormalizeCacheLifeProfile:
 // https://github.com/vercel/next.js/blob/f464e32ec092c5a00c967e64cba40121a2992224/packages/next/src/server/use-cache/cache-life-profile.ts
 function normalizeCacheLifeValue(
