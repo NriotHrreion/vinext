@@ -12,7 +12,14 @@ import {
 
 export type { CacheLifeConfig } from "../utils/cache-life-profiles.js";
 
-export const cacheLifeProfiles: Record<string, CacheLifeConfig> = createDefaultCacheLifeProfiles();
+declare const __VINEXT_CACHE_LIFE_PROFILES__: string | undefined;
+
+// Vite substitutes this constant separately in each application's module graphs.
+// Direct shim imports have no injected constant and retain the built-in profiles.
+export const cacheLifeProfiles: Record<string, CacheLifeConfig> =
+  typeof __VINEXT_CACHE_LIFE_PROFILES__ === "undefined"
+    ? createDefaultCacheLifeProfiles()
+    : (JSON.parse(__VINEXT_CACHE_LIFE_PROFILES__) as Record<string, CacheLifeConfig>);
 
 type CacheContextLike = {
   tags: string[];
