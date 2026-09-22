@@ -29,6 +29,7 @@ import {
   hasViteConfig,
 } from "./utils/project.js";
 import {
+  cssModulesConfigSource,
   setupCloudflarePlatform,
   updateViteConfigForCssModules,
   usesCommonJsViteConfig,
@@ -146,46 +147,36 @@ export function generateViteConfig(
   hasCssModules = false,
 ): string {
   const vinextCall = prerender ? `vinext({ prerender: { routes: "*" } })` : "vinext()";
-  const baseConfig = `import vinext from "vinext";
-import { defineConfig } from "vite";
+  return `import vinext from "vinext";
+import { defineConfig } from "vite";${hasCssModules ? '\nimport { createHash } from "node:crypto";\nimport path from "node:path";\nimport { patchCssModules } from "vite-css-modules";' : ""}
 
 export default defineConfig({
-  plugins: [${vinextCall}],
+  plugins: [${hasCssModules ? 'patchCssModules({ exportMode: "default" }), ' : ""}${vinextCall}],${hasCssModules ? cssModulesConfigSource() : ""}
 });
 `;
-  return hasCssModules
-    ? updateViteConfigForCssModules("vite.config.ts", baseConfig).code
-    : baseConfig;
 }
 
-const CSS_MODULE_PATTERN = /\.module\.(?:css|scss|sass)$/;
 const CSS_MODULE_GLOBS = [
   "**/*.module.{css,scss,sass}",
   "**/.*.module.{css,scss,sass}",
   "**/.*/**/*.module.{css,scss,sass}",
   "**/.*/**/.*.module.{css,scss,sass}",
 ];
-const CSS_MODULE_SCAN_IGNORES = new Set(["node_modules", ".git", ".next", ".vinext", ".wrangler"]);
-const CSS_MODULE_ROOT_SCAN_IGNORES = new Set(["dist", "out", "build", "coverage"]);
+const CSS_MODULE_IGNORES = new Set(["node_modules", ".git", ".next", ".vinext", ".wrangler"]);
+const CSS_MODULE_ROOT_IGNORES = new Set(["dist", "out", "build", "coverage"]);
 
-/** Detect project-owned CSS, SCSS, or Sass module files. */
 export function scanCssModuleFiles(root: string): boolean {
-  try {
-    const canonicalRoot = path.resolve(root);
-    return fs
-      .globSync(CSS_MODULE_GLOBS, {
-        cwd: root,
-        withFileTypes: true,
-        exclude: (entry) =>
-          entry.isDirectory() &&
-          (CSS_MODULE_SCAN_IGNORES.has(entry.name) ||
-            (toSlash(entry.parentPath) === canonicalRoot &&
-              CSS_MODULE_ROOT_SCAN_IGNORES.has(entry.name))),
-      })
-      .some((entry) => CSS_MODULE_PATTERN.test(entry.name));
-  } catch {
-    return false;
-  }
+  const canonicalRoot = path.resolve(root);
+  return fs
+    .globSync(CSS_MODULE_GLOBS, {
+      cwd: root,
+      withFileTypes: true,
+      exclude: (entry) =>
+        entry.isDirectory() &&
+        (CSS_MODULE_IGNORES.has(entry.name) ||
+          (toSlash(entry.parentPath) === canonicalRoot && CSS_MODULE_ROOT_IGNORES.has(entry.name))),
+    })
+    .some((entry) => /\.module\.(css|scss|sass)$/.test(entry.name));
 }
 
 // ─── Script Addition ─────────────────────────────────────────────────────────
@@ -494,14 +485,12 @@ type PlatformSetupResult = {
 function setupNodePlatform(context: PlatformSetupContext): PlatformSetupResult {
   if (context.viteConfigExists && !context.force) {
     if (context.hasCssModules && context.existingViteConfigPath) {
-      const currentConfig = fs.readFileSync(context.existingViteConfigPath, "utf-8");
-      const update = updateViteConfigForCssModules(context.existingViteConfigPath, currentConfig);
-      if (update.changed) {
-        fs.writeFileSync(context.existingViteConfigPath, update.code, "utf-8");
-      }
+      const current = fs.readFileSync(context.existingViteConfigPath, "utf-8");
+      const update = updateViteConfigForCssModules(context.existingViteConfigPath, current);
+      if (update.code !== current) fs.writeFileSync(context.existingViteConfigPath, update.code);
       return {
-        generatedViteConfig: update.changed,
-        skippedViteConfig: !update.changed,
+        generatedViteConfig: update.code !== current,
+        skippedViteConfig: update.code === current,
         generatedPlatformFiles: [],
         nextSteps: [],
         preservedExistingGenerateScopedName: update.preservedExistingGenerateScopedName,
@@ -610,7 +599,6 @@ export async function init(options: InitOptions): Promise<InitResult> {
         root,
         isAppRouter: isApp,
         existingViteConfigPath,
-        force: options.force,
         prerender: options.prerender,
         hasCssModules,
         today: options._today,
@@ -827,7 +815,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
   }
   if (platformSetup.preservedExistingGenerateScopedName) {
     console.log(
-      `    ${terminalStyle.yellow("!")} Preserved existing css.modules.generateScopedName; verify that it produces identical class names in the SSR and client environments`,
+      `    ${terminalStyle.yellow("!")} Preserved existing css.modules.generateScopedName; verify it produces identical class names in SSR and client builds`,
     );
   }
 
