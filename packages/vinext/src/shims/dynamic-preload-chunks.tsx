@@ -26,8 +26,7 @@
  */
 import React from "react";
 import { getPagesClientAssets } from "vinext/server/pages-client-assets";
-import * as ReactDOM from "react-dom";
-import { useScriptNonce } from "./script-nonce-context.js";
+import { useInitialStylesheetHrefs, useScriptNonce } from "./script-nonce-context.js";
 import { appendAssetDeploymentIdQuery } from "../utils/deployment-id.js";
 
 function dynamicPreloadHref(file: string): string {
@@ -69,6 +68,7 @@ function resolveDynamicPreloadFiles(moduleIds: readonly string[] | undefined): s
 
 export function DynamicPreloadChunks(props: { moduleIds?: readonly string[] }) {
   const nonce = useScriptNonce();
+  const initialStylesheetHrefs = useInitialStylesheetHrefs();
   // Defensive guard matching Next.js's <PreloadChunks> `typeof window` check:
   // this component only does work during SSR. The runtime global is server-only
   // today (so on the client the map is absent/undefined and we already return
@@ -78,17 +78,20 @@ export function DynamicPreloadChunks(props: { moduleIds?: readonly string[] }) {
   if (typeof window !== "undefined") return null;
   const files = resolveDynamicPreloadFiles(props.moduleIds);
   if (files.length === 0) return null;
+  const crossOrigin = getPagesClientAssets().crossOrigin ?? "";
 
-  const stylesheets: React.ReactNode[] = [];
+  const preloadLinks: React.ReactNode[] = [];
   for (const file of files) {
     const assetHref = dynamicPreloadHref(file);
     if (assetHref.endsWith(".css")) {
       const href = appendAssetDeploymentIdQuery(assetHref);
-      stylesheets.push(
+      if (initialStylesheetHrefs?.has(href)) continue;
+      preloadLinks.push(
         React.createElement("link", {
           key: href,
           rel: "stylesheet",
           href,
+          crossOrigin,
           nonce,
           precedence: "dynamic",
         }),
@@ -96,17 +99,26 @@ export function DynamicPreloadChunks(props: { moduleIds?: readonly string[] }) {
       continue;
     }
 
-    if (assetHref.endsWith(".js") && typeof ReactDOM.preload === "function") {
-      // Pass `nonce` directly (React omits the attribute when it is undefined),
-      // matching the stylesheet branch above.
-      const preloadOptions: ReactDOM.PreloadOptions = {
-        as: "script",
-        fetchPriority: "low",
-        nonce,
-      };
-      ReactDOM.preload(assetHref, preloadOptions);
+    if (assetHref.endsWith(".js")) {
+      // Unlike Next.js's webpack chunks, Vite's client chunks are ES modules and
+      // are already hinted with modulepreload. Render the resource directly so
+      // React hoists it into <head> while preserving the CSP nonce and low
+      // fetch priority; matching the eager hint mode lets browsers reuse it.
+      preloadLinks.push(
+        React.createElement("link", {
+          key: assetHref,
+          rel: "modulepreload",
+          href: assetHref,
+          as: "script",
+          crossOrigin,
+          fetchPriority: "low",
+          nonce,
+        }),
+      );
     }
   }
 
-  return stylesheets.length > 0 ? React.createElement(React.Fragment, null, ...stylesheets) : null;
+  return preloadLinks.length > 0
+    ? React.createElement(React.Fragment, null, ...preloadLinks)
+    : null;
 }

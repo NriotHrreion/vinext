@@ -48,10 +48,14 @@ test.describe("Cloudflare Workers dynamic preloads", () => {
     );
 
     const dynamicScriptPreloads = page.locator(
-      'link[rel="preload"][as="script"][fetchpriority="low"]',
+      'link[rel="modulepreload"][as="script"][fetchpriority="low"]',
     );
     await expect(dynamicScriptPreloads).not.toHaveCount(0);
+    await expect(page.locator('link[rel="preload"][as="script"][fetchpriority="low"]')).toHaveCount(
+      0,
+    );
     for (const preload of await dynamicScriptPreloads.all()) {
+      expect(await preload.getAttribute("crossorigin")).toBe("");
       expect(await preload.evaluate((element) => (element as HTMLLinkElement).nonce)).toBe(
         "vinext-test-nonce",
       );

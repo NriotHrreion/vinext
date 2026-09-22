@@ -13,7 +13,12 @@ import fs from "node:fs";
 import { createServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { buildPagesFixture, buildAppFixture, buildCloudflareAppFixture } from "./helpers.js";
+import {
+  buildPagesFixture,
+  buildAppFixture,
+  buildCloudflareAppFixture,
+  createIsolatedFixture,
+} from "./helpers.js";
 import {
   extractRscPayloadFromPrerenderedHtml,
   resolveParentParams,
@@ -914,7 +919,11 @@ describe("prerenderPages — default mode (pages-basic)", () => {
       expect(html).toContain('<p id="identity-consistent">true</p>');
       expect(html).toContain('<p id="shadowed-global-this">local-globalThis</p>');
       expect(html).toContain('<p id="filename-readable">true</p>');
-      expect(html).toMatch(/<p id="concatenated-path">.*\/server\/concatenated\.js<\/p>/);
+      // instrumentation.ts completes before the lazy user-module graph loads,
+      // and bundled CommonJS globals retain that emitted chunk identity.
+      expect(html).toMatch(
+        /<p id="concatenated-path">.*\/server\/_next\/static\/concatenated\.js<\/p>/,
+      );
     }
   });
 
@@ -1816,6 +1825,60 @@ describe("prerender — generateStaticParams/getStaticPaths errors (#1982)", () 
     }
   });
 
+  // Next.js keeps a route with generateStaticParams() returning [] in its SSG
+  // prerender metadata so unknown paths can be generated on demand.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/build/templates/app-page-runtime.ts
+  it("retains route-level SSG metadata when generateStaticParams returns no paths", async () => {
+    const root = tmpDir("vinext-prerender-empty-gsp-");
+    const outDir = path.join(root, "out");
+    const pageDir = path.join(root, "app", "blog", "[slug]");
+    fs.mkdirSync(pageDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pageDir, "page.tsx"),
+      "export function generateStaticParams() { return []; }\nexport default function Page() { return null; }\n",
+    );
+
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (url.pathname === "/__vinext/prerender/static-params") {
+        res.setHeader("content-type", "application/json");
+        res.end("[]");
+        return;
+      }
+      res.statusCode = 500;
+      res.end("an empty static params route should not render at build time");
+    });
+
+    const port = await listen(server);
+    try {
+      const { prerenderApp } = await import("../packages/vinext/src/build/prerender.js");
+      const { appRouter } = await import("../packages/vinext/src/routing/app-router.js");
+      const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
+      const routes = await appRouter(path.join(root, "app"));
+      const result = await prerenderApp({
+        mode: "default",
+        rscBundlePath: path.join(root, "dist", "server", "index.js"),
+        routes,
+        outDir,
+        config: await resolveNextConfig({}),
+        _prodServer: { server, port },
+      });
+
+      expect(result.routes).toContainEqual({
+        route: "/blog/:slug",
+        status: "skipped",
+        reason: "empty-static-params",
+      });
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(outDir, "vinext-prerender.json"), "utf8"),
+      );
+      expect(manifest.pregeneratedConcretePaths).toContainEqual(["/blog/:slug", []]);
+    } finally {
+      await closeServer(server);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("surfaces a thrown getStaticPaths error instead of silently skipping the route", async () => {
     const root = tmpDir("vinext-prerender-pages-gsp-error-");
     const outDir = path.join(root, "out");
@@ -2015,25 +2078,35 @@ describe("prerenderApp — cacheComponents PPR fallback-shell artifacts", () => 
 // ─── runPrerender — output: 'export' wiring ───────────────────────────────────
 
 describe("runPrerender — output: 'export' wiring", () => {
+  let fixtureDir: string;
   let pagesBundlePath: string;
   let exportNextConfig: Awaited<
     ReturnType<typeof import("../packages/vinext/src/config/next-config.js").resolveNextConfig>
   >;
 
   beforeAll(async () => {
-    // Build pages-basic to a fresh tmpdir — no fixture copying needed.
+    fixtureDir = await createIsolatedFixture(
+      PAGES_FIXTURE,
+      "vinext-run-prerender-",
+      undefined,
+      path.join(PAGES_FIXTURE, "node_modules"),
+    );
     // Pass the bundle path and resolved config to runPrerender so it
     // exercises output: 'export' without touching the real next.config.mjs.
     pagesBundlePath = await buildPagesFixture(PAGES_FIXTURE);
     const { resolveNextConfig } = await import("../packages/vinext/src/config/next-config.js");
-    exportNextConfig = await resolveNextConfig({ output: "export" }, PAGES_FIXTURE);
+    exportNextConfig = await resolveNextConfig({ output: "export" }, fixtureDir);
   }, 120_000);
+
+  afterAll(() => {
+    fs.rmSync(fixtureDir, { recursive: true, force: true });
+  });
 
   it("throws when next.config output: 'export' and SSR routes exist", async () => {
     const { runPrerender } = await import("../packages/vinext/src/build/run-prerender.js");
     await expect(
       runPrerender({
-        root: PAGES_FIXTURE,
+        root: fixtureDir,
         nextConfig: exportNextConfig,
         pagesBundlePath,
       }),
@@ -2041,7 +2114,7 @@ describe("runPrerender — output: 'export' wiring", () => {
   });
 
   it("does not reload disk config when the caller supplies resolved config", async () => {
-    const configPath = path.join(PAGES_FIXTURE, "next.config.mjs");
+    const configPath = path.join(fixtureDir, "next.config.mjs");
     const originalConfig = fs.readFileSync(configPath, "utf-8");
 
     try {
@@ -2050,11 +2123,11 @@ describe("runPrerender — output: 'export' wiring", () => {
         import("../packages/vinext/src/build/run-prerender.js"),
         import("../packages/vinext/src/config/next-config.js"),
       ]);
-      const nextConfig = await resolveNextConfig({ output: "export" }, PAGES_FIXTURE);
+      const nextConfig = await resolveNextConfig({ output: "export" }, fixtureDir);
 
       await expect(
         runPrerender({
-          root: PAGES_FIXTURE,
+          root: fixtureDir,
           nextConfig,
           pagesBundlePath,
         }),
@@ -2065,7 +2138,7 @@ describe("runPrerender — output: 'export' wiring", () => {
   });
 
   it("does not rewrite the Worker entry when prerender validation fails", async () => {
-    const workerEntry = path.join(PAGES_FIXTURE, "dist", "server", "index.js");
+    const workerEntry = path.join(fixtureDir, "dist", "server", "index.js");
     const source = 'export default { fetch() { return new Response("unchanged"); } };\n';
     fs.mkdirSync(path.dirname(workerEntry), { recursive: true });
     fs.writeFileSync(workerEntry, source, "utf-8");
@@ -2074,7 +2147,7 @@ describe("runPrerender — output: 'export' wiring", () => {
       const { runPrerender } = await import("../packages/vinext/src/build/run-prerender.js");
       await expect(
         runPrerender({
-          root: PAGES_FIXTURE,
+          root: fixtureDir,
           nextConfig: exportNextConfig,
           pagesBundlePath,
         }),
@@ -2082,7 +2155,7 @@ describe("runPrerender — output: 'export' wiring", () => {
 
       expect(fs.readFileSync(workerEntry, "utf-8")).toBe(source);
     } finally {
-      fs.rmSync(path.join(PAGES_FIXTURE, "dist"), { recursive: true, force: true });
+      fs.rmSync(path.join(fixtureDir, "dist"), { recursive: true, force: true });
     }
   });
 
@@ -2090,7 +2163,7 @@ describe("runPrerender — output: 'export' wiring", () => {
     const { runPrerender } = await import("../packages/vinext/src/build/run-prerender.js");
     await expect(
       runPrerender({
-        root: PAGES_FIXTURE,
+        root: fixtureDir,
         nextConfig: exportNextConfig,
         pagesBundlePath,
       }),

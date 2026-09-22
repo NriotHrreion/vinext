@@ -285,6 +285,7 @@ type CreateDispatchOptionsOverrides = {
   bypassInterceptionContextCache?: DispatchOptions["bypassInterceptionContextCache"];
   cleanPathname?: string;
   clearRequestContext?: DispatchOptions["clearRequestContext"];
+  createRscOnErrorHandler?: DispatchOptions["createRscOnErrorHandler"];
   dynamicConfig?: DispatchOptions["dynamicConfig"];
   dynamicParamsConfig?: DispatchOptions["dynamicParamsConfig"];
   findIntercept?: DispatchOptions["findIntercept"];
@@ -349,9 +350,7 @@ function createDispatchOptions(overrides: CreateDispatchOptionsOverrides = {}) {
     bypassInterceptionContextCache: overrides.bypassInterceptionContextCache,
     cleanPathname: overrides.cleanPathname ?? "/posts/hello",
     clearRequestContext,
-    createRscOnErrorHandler() {
-      return () => null;
-    },
+    createRscOnErrorHandler: overrides.createRscOnErrorHandler ?? (() => () => undefined),
     draftModeSecret: "draft-secret",
     dynamicConfig: overrides.dynamicConfig,
     dynamicParamsConfig: overrides.dynamicParamsConfig,
@@ -797,6 +796,49 @@ describe("app page dispatch", () => {
     expect(cachePolicy.cacheControl.revalidate).toBe(60);
     expect(cachePolicy.tags).toEqual(expect.arrayContaining(["_N_T_/posts/hello"]));
     expect(cachePolicy.cacheControl.expire).toBeUndefined();
+  });
+
+  it("writes HTML-captured RSC data under the plain key when interception context is absent", async () => {
+    const isrSet = vi.fn<DispatchOptions["isrSet"]>(async () => {});
+    const waitUntilPromises: Promise<unknown>[] = [];
+    const executionContext = {
+      waitUntil(promise) {
+        waitUntilPromises.push(promise);
+      },
+    } satisfies ExecutionContextLike;
+    const { options } = createDispatchOptions({
+      cleanPathname: "/photos/123",
+      interceptionContext: null,
+      isProduction: true,
+      isrRscKey(pathname, mountedSlotsHeader, _renderMode, interceptionContext) {
+        return `rsc:${pathname}:${mountedSlotsHeader ?? "none"}:${interceptionContext ?? "none"}`;
+      },
+      isrSet,
+      loadSsrHandler: async () => ({
+        async handleSsr(_rscStream, _navigationContext, _fontData, captureOptions) {
+          if (captureOptions?.capturedRscDataRef) {
+            captureOptions.capturedRscDataRef.value = Promise.resolve(
+              new TextEncoder().encode("direct-flight").buffer,
+            );
+          }
+          void captureOptions?.sideStream?.cancel().catch(() => {});
+          return createStream(["<html>direct</html>"]);
+        },
+      }),
+      revalidateSeconds: 60,
+    });
+
+    const response = await runWithExecutionContext(executionContext, () =>
+      dispatchAppPage(options),
+    );
+    await response.text();
+    await Promise.all(waitUntilPromises.splice(0));
+
+    const writtenKeys = isrSet.mock.calls.map(([key]) => key);
+    expect(writtenKeys).toHaveLength(2);
+    expect(writtenKeys).toEqual(
+      expect.arrayContaining(["html:/photos/123", "rsc:/photos/123:none:none"]),
+    );
   });
 
   it("does not reuse queryless HTML when the page reads searchParams", async () => {
@@ -2872,6 +2914,7 @@ describe("app page dispatch", () => {
     let capturedServeStreamingMetadata: boolean | undefined;
     let afterRan = false;
     const isrSet = vi.fn(async () => {});
+    const createRscOnErrorHandler = vi.fn(() => () => null);
     const { options } = createDispatchOptions({
       buildPageElement: async (_route, _params, _opts, _searchParams, _layout, buildOptions) => {
         capturedServeStreamingMetadata = buildOptions?.serveStreamingMetadata;
@@ -2881,6 +2924,7 @@ describe("app page dispatch", () => {
         return React.createElement("main", null, "fresh");
       },
       cleanPathname: "/posts/hello",
+      createRscOnErrorHandler,
       isProduction: true,
       isrGet: vi.fn(async () =>
         buildISRCacheEntry(buildCachedAppPageValue("<html>stale</html>"), true),
@@ -2922,8 +2966,62 @@ describe("app page dispatch", () => {
     expect(capturedWaitForAllReady).toBe(true);
     expect(capturedServeStreamingMetadata).toBe(false);
     expect(capturedFallbackToErrorDocument).toBeUndefined();
+    expect(createRscOnErrorHandler).toHaveBeenCalledWith("/posts/hello", "/posts/[slug]", {
+      revalidateReason: "stale",
+    });
+    expect(createRscOnErrorHandler).toHaveBeenCalledWith("/posts/hello", "/posts/[slug]", {
+      renderSource: "server-rendering",
+      revalidateReason: "stale",
+    });
     expect(isrSet).toHaveBeenCalled();
     expect(afterRan).toBe(true);
+  });
+
+  it("regenerates stale HTML-captured RSC data under the plain key without interception context", async () => {
+    let scheduledRender: unknown = null;
+    const isrSet = vi.fn<DispatchOptions["isrSet"]>(async () => {});
+    const { options } = createDispatchOptions({
+      cleanPathname: "/photos/123",
+      interceptionContext: null,
+      isProduction: true,
+      isrGet: vi.fn(async () =>
+        buildISRCacheEntry(buildCachedAppPageValue("<html>stale direct</html>"), true),
+      ),
+      isrRscKey(pathname, mountedSlotsHeader, _renderMode, interceptionContext) {
+        return `rsc:${pathname}:${mountedSlotsHeader ?? "none"}:${interceptionContext ?? "none"}`;
+      },
+      isrSet,
+      loadSsrHandler: async () => ({
+        async handleSsr(_rscStream, _navigationContext, _fontData, captureOptions) {
+          if (captureOptions?.capturedRscDataRef) {
+            captureOptions.capturedRscDataRef.value = Promise.resolve(
+              new TextEncoder().encode("regenerated-direct-flight").buffer,
+            );
+          }
+          void captureOptions?.sideStream?.cancel().catch(() => {});
+          return createStream(["<html>regenerated direct</html>"]);
+        },
+      }),
+      revalidateSeconds: 60,
+      scheduleBackgroundRegeneration(_key, renderFn) {
+        scheduledRender = renderFn;
+      },
+    });
+
+    const response = await dispatchAppPage(options);
+    await expect(response.text()).resolves.toBe("<html>stale direct</html>");
+    expect(typeof scheduledRender).toBe("function");
+    if (typeof scheduledRender !== "function") {
+      throw new Error("expected stale HTML response to schedule regeneration");
+    }
+
+    await scheduledRender();
+
+    const writtenKeys = isrSet.mock.calls.map(([key]) => key);
+    expect(writtenKeys).toHaveLength(2);
+    expect(writtenKeys).toEqual(
+      expect.arrayContaining(["html:/photos/123", "rsc:/photos/123:none:none"]),
+    );
   });
 
   it.each(["page", "metadata"] as const)(
@@ -3033,31 +3131,47 @@ describe("app page dispatch", () => {
     },
   );
 
-  it("preserves stale HTML when SSR shell rendering fails during regeneration", async () => {
+  it("does not report a stale RSC failure again after Flight recreates the error", async () => {
     const route = createRoute({ pattern: "/posts/[slug]", routeSegments: ["posts", "[slug]"] });
     let scheduledRender: unknown = null;
+    let scheduledErrorContext:
+      | Parameters<DispatchOptions["scheduleBackgroundRegeneration"]>[2]
+      | undefined;
     const scheduleBackgroundRegeneration: DispatchOptions["scheduleBackgroundRegeneration"] = (
       _key,
       renderFn,
+      errorContext,
     ) => {
       scheduledRender = renderFn;
+      scheduledErrorContext = errorContext;
     };
     const isrSet = vi.fn(async () => {});
-    const shellError = new Error("SSR shell failed");
+    const originalRscError = new Error("RSC regeneration failed");
+    const decodedRscError = Object.assign(new Error("decoded RSC regeneration failure"), {
+      digest: "rsc-regeneration-digest",
+    });
+    const reportRscError = vi.fn(() => "rsc-regeneration-digest");
+    const reportSsrError = vi.fn(() => "ssr-digest");
+    const createRscOnErrorHandler = vi.fn((_pathname, _routePath, overrides) =>
+      overrides?.renderSource === "server-rendering" ? reportSsrError : reportRscError,
+    );
     const { options } = createDispatchOptions({
       buildPageElement: async () => React.createElement("main", null, "fresh"),
       cleanPathname: "/posts/hello",
+      createRscOnErrorHandler,
       isProduction: true,
       isrGet: vi.fn(async () =>
         buildISRCacheEntry(buildCachedAppPageValue("<html>stale</html>"), true),
       ),
       isrSet,
       loadSsrHandler: async () => ({
-        async handleSsr() {
-          throw shellError;
+        async handleSsr(_rscStream, _navigationContext, _fontData, captureOptions) {
+          captureOptions?.onSsrError?.(decodedRscError);
+          throw decodedRscError;
         },
       }),
-      renderToReadableStream() {
+      renderToReadableStream(_element, { onError }) {
+        onError(originalRscError, undefined, undefined);
         return createStream(["flight"]);
       },
       revalidateSeconds: 60,
@@ -3074,8 +3188,13 @@ describe("app page dispatch", () => {
       throw new Error("expected stale HTML response to schedule regeneration");
     }
 
-    await expect(scheduledRender()).rejects.toBe(shellError);
+    await expect(scheduledRender()).rejects.toBe(decodedRscError);
     expect(isrSet).not.toHaveBeenCalled();
+    expect(reportRscError).toHaveBeenCalledOnce();
+    expect(reportRscError).toHaveBeenCalledWith(originalRscError, undefined, undefined);
+    expect(reportSsrError).not.toHaveBeenCalled();
+    expect(scheduledErrorContext?.shouldReport?.(decodedRscError)).toBe(false);
+    expect(scheduledErrorContext?.shouldReport?.(new Error("different failure"))).toBe(true);
   });
 
   it("resolves the revalidation target route's dynamic config for force-dynamic fetch defaults", async () => {

@@ -827,6 +827,60 @@ test.describe("Shallow Routing (history.pushState/replaceState)", () => {
     await expect(page.locator("#search-result")).toHaveText("Results for: one");
   });
 
+  // Ported and strengthened from Next.js:
+  // test/e2e/app-dir/shallow-routing/shallow-routing.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/shallow-routing/shallow-routing.test.ts
+  test("pushState branch after Back keeps usePathname synchronized", async ({ page }) => {
+    await page.goto(`${BASE}/shallow-test`);
+    await waitForAppRouterHydration(page);
+    const pathname = page.locator('[data-testid="pathname"]');
+
+    await page.evaluate(() => window.history.pushState(null, "", "/a"));
+    await expect(pathname).toHaveText("pathname: /a");
+    await page.evaluate(() => window.history.pushState(null, "", "/b"));
+    await expect(pathname).toHaveText("pathname: /b");
+
+    await page.goBack();
+    await expect(pathname).toHaveText("pathname: /a");
+    await page.evaluate(() => window.history.pushState(null, "", "/"));
+    await expect(pathname).toHaveText("pathname: /");
+
+    await page.goBack();
+    await expect(pathname).toHaveText("pathname: /a");
+    await page.goBack();
+    await expect(pathname).toHaveText("pathname: /shallow-test");
+    await page.goForward();
+    await expect(pathname).toHaveText("pathname: /a");
+  });
+
+  test("multi-entry traversal restores a shallow tree at the same URL", async ({ page }) => {
+    await page.goto(`${BASE}/shallow-test`);
+    await waitForAppRouterHydration(page);
+
+    // Keep the shallow-test tree under /about, then render /about normally via
+    // an intermediate route. The traversal lands on the same visible URL but
+    // must restore the older entry's shallow-test tree.
+    await page.evaluate(() => window.history.pushState(null, "", "/about"));
+    await expect(page.locator('[data-testid="pathname"]')).toHaveText("pathname: /about");
+    await page.evaluate(() => {
+      const router = window.next?.router;
+      if (!router) throw new Error("window.next.router is not installed");
+      void router.push("/");
+    });
+    await expect(page.getByRole("heading", { name: "Welcome to App Router" })).toBeVisible();
+    await page.evaluate(() => {
+      const router = window.next?.router;
+      if (!router) throw new Error("window.next.router is not installed");
+      void router.push("/about");
+    });
+    await expect(page.locator("h1#app-page")).toHaveText("About");
+
+    await page.evaluate(() => window.history.go(-2));
+    await expect(page).toHaveURL(/\/about$/);
+    await expect(page.getByRole("heading", { name: "Shallow Routing Test" })).toBeVisible();
+    await expect(page.locator('[data-testid="pathname"]')).toHaveText("pathname: /about");
+  });
+
   test("pushState entry keeps its copied tree across router refresh", async ({ page }) => {
     await page.goto(`${BASE}/nextjs-compat/refresh-test`);
     await waitForAppRouterHydration(page);

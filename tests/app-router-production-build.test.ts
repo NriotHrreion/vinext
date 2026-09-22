@@ -3,10 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { createBuilder } from "vite";
-import { afterAll, describe, expect, it, vi } from "vite-plus/test";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vite-plus/test";
 import vinext from "../packages/vinext/src/index.js";
 import { runPrerender } from "../packages/vinext/src/build/run-prerender.js";
-import { APP_FIXTURE_DIR } from "./helpers.js";
+import { APP_FIXTURE_DIR, createIsolatedFixture, testCacheDir } from "./helpers.js";
 
 type BuiltAppHandler = (request: Request) => Promise<Response | string | null | undefined>;
 
@@ -33,17 +33,29 @@ function readAllJs(dir: string): string {
 }
 
 describe("App Router Production build", () => {
-  const outDir = path.resolve(APP_FIXTURE_DIR, "dist");
+  let fixtureDir: string;
+  let outDir: string;
+
+  beforeAll(async () => {
+    fixtureDir = await createIsolatedFixture(
+      APP_FIXTURE_DIR,
+      "vinext-app-production-build-",
+      undefined,
+      path.join(APP_FIXTURE_DIR, "node_modules"),
+    );
+    outDir = path.join(fixtureDir, "dist");
+  });
 
   afterAll(() => {
-    fs.rmSync(outDir, { recursive: true, force: true });
+    fs.rmSync(fixtureDir, { recursive: true, force: true });
   });
 
   it("produces RSC/SSR/client bundles via vite build", async () => {
     const builder = await createBuilder({
-      root: APP_FIXTURE_DIR,
+      root: fixtureDir,
+      cacheDir: testCacheDir(fixtureDir),
       configFile: false,
-      plugins: [vinext({ appDir: APP_FIXTURE_DIR })],
+      plugins: [vinext({ appDir: fixtureDir })],
       logLevel: "silent",
     });
     await builder.buildApp();
@@ -118,12 +130,17 @@ describe("App Router Production build", () => {
     // RSC bundle should contain route handling code
     const rscEntry = fs.readFileSync(path.join(outDir, "server", "index.js"), "utf-8");
     expect(rscEntry).toContain("handler");
+    // The Node production host starts the request root outside the bundled
+    // Worker handler, so the default export must retain its registration hook.
+    expect(rscEntry).toContain("__ensureInstrumentation");
+    expect(readAllJs(path.join(outDir, "server"))).not.toContain("cloudflare:workers");
+    expect(readAllJs(path.join(outDir, "server"))).not.toContain("cloudflare-workers");
 
     // Asset manifest should be generated
     expect(fs.existsSync(path.join(outDir, "server", "__vite_rsc_assets_manifest.js"))).toBe(true);
 
-    // BUILD_ID must be written to dist/server so post-build tools (TPR,
-    // seed-cache) and the e2e deploy harness can read the build identifier
+    // BUILD_ID must be written to dist/server so post-build tools such as
+    // seed-cache and the e2e deploy harness can read the build identifier
     // without parsing the (minified) server bundle. Regression guard: the
     // vinext:build-id plugin previously used closeBundle, which does not fire
     // during the multi-environment buildApp() pipeline, so the file was
@@ -193,9 +210,10 @@ describe("App Router Production build", () => {
     process.env.__VINEXT_SHARED_BUILD_ID = sharedBuildId;
     try {
       const builder = await createBuilder({
-        root: APP_FIXTURE_DIR,
+        root: fixtureDir,
+        cacheDir: testCacheDir(fixtureDir),
         configFile: false,
-        plugins: [vinext({ appDir: APP_FIXTURE_DIR })],
+        plugins: [vinext({ appDir: fixtureDir })],
         logLevel: "silent",
       });
       await builder.buildApp();
@@ -223,9 +241,10 @@ describe("App Router Production build", () => {
     process.env.__VINEXT_SHARED_PRERENDER_SECRET = sharedSecret;
     try {
       const builder = await createBuilder({
-        root: APP_FIXTURE_DIR,
+        root: fixtureDir,
+        cacheDir: testCacheDir(fixtureDir),
         configFile: false,
-        plugins: [vinext({ appDir: APP_FIXTURE_DIR })],
+        plugins: [vinext({ appDir: fixtureDir })],
         logLevel: "silent",
       });
       await builder.buildApp();
@@ -254,11 +273,12 @@ describe("App Router Production build", () => {
     process.env.__VINEXT_SHARED_BUILD_ID = sharedBuildId;
     try {
       const builder = await createBuilder({
-        root: APP_FIXTURE_DIR,
+        root: fixtureDir,
+        cacheDir: testCacheDir(fixtureDir),
         configFile: false,
         // generateBuildId returning null falls back to a random UUID per
         // instance; the shared ID must still be adopted.
-        plugins: [vinext({ appDir: APP_FIXTURE_DIR, nextConfig: { generateBuildId: () => null } })],
+        plugins: [vinext({ appDir: fixtureDir, nextConfig: { generateBuildId: () => null } })],
         logLevel: "silent",
       });
       await builder.buildApp();
@@ -287,9 +307,10 @@ describe("App Router Production build", () => {
     process.env.__VINEXT_SHARED_RSC_COMPATIBILITY_ID = sharedCompatId;
     try {
       const builder = await createBuilder({
-        root: APP_FIXTURE_DIR,
+        root: fixtureDir,
+        cacheDir: testCacheDir(fixtureDir),
         configFile: false,
-        plugins: [vinext({ appDir: APP_FIXTURE_DIR })],
+        plugins: [vinext({ appDir: fixtureDir })],
         logLevel: "silent",
       });
       await builder.buildApp();
@@ -581,9 +602,10 @@ export default async function OpenGraphImage() {
     const { preview } = await import("vite");
 
     const previewServer = await preview({
-      root: APP_FIXTURE_DIR,
+      root: fixtureDir,
+      cacheDir: testCacheDir(fixtureDir),
       configFile: false,
-      plugins: [vinext({ appDir: APP_FIXTURE_DIR })],
+      plugins: [vinext({ appDir: fixtureDir })],
       preview: { port: 0 },
       logLevel: "silent",
     });
